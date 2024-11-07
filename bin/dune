@@ -1,0 +1,3 @@
+(executable
+ (name client)
+ (libraries cohttp-lwt-unix lwt))
