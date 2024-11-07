@@ -1,0 +1,15 @@
+(library
+ (name kvstore)
+ (libraries ocaml-protoc-plugin))
+
+(rule
+ (targets kvstore.ml)
+ (deps
+  (:proto kvstore.proto))
+ (action
+  (run
+   protoc
+   -I
+   .
+   "--ocaml_out=annot=[@@deriving show { with_path = false }]:."
+   %{proto})))

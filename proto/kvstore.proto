@@ -1,0 +1,52 @@
+// proto/kvstore.proto
+
+syntax = "proto3";
+
+package kvstore;
+
+// Messages
+message State {
+    int32 term = 1;
+    bool isLeader = 2; 
+}
+
+message KeyValue {
+    string key = 1;
+    string value = 2;
+    int64 ClientId = 3;
+    int64 RequestId = 4;
+}
+
+message GetKey {
+    string key = 1;
+    int64 ClientId = 2;
+    int64 RequestId = 3;
+}
+
+message Reply {
+    bool wrongLeader = 1;
+    string error = 2;
+    string value = 3;
+}
+
+message Empty {}
+
+message IntegerArg {
+    int32 arg = 1;
+}
+
+// KeyValueStore Service
+service KeyValueStore {
+    rpc GetState(Empty) returns (State) {};
+    rpc Get(GetKey) returns (Reply) {};
+    rpc Put(KeyValue) returns (Reply) {};
+    rpc Replace(KeyValue) returns (Reply) {};
+}
+
+// FrontEnd Service
+service FrontEnd {
+    rpc Get(GetKey) returns (Reply) {};
+    rpc Put(KeyValue) returns (Reply) {};
+    rpc Replace(KeyValue) returns (Reply) {};
+    rpc StartRaft(IntegerArg) returns (Reply) {};
+}
