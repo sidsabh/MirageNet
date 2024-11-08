@@ -9,3 +9,15 @@
   kvstore
   h2
   h2-lwt-unix))
+
+(executable
+ (name test_frontend_start_raft)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  kvstore
+  h2
+  h2-lwt-unix))

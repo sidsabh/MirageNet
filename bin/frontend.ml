@@ -2,6 +2,9 @@
 open Grpc_lwt
 open Kvstore
 
+(* Global vars *)
+let num_servers = ref 0
+
 (* Decode the incoming GetKey request *)
 let handle_get_request buffer =
   let open Ocaml_protoc_plugin in
@@ -52,19 +55,38 @@ let handle_replace_request buffer =
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding Replace request: %s" (Result.show_error e))
 
+(* spawn server processes *)
+let spawn_server i =
+  let command = "dune" in
+  let args = [| "dune"; "exec"; "bin/server.exe"; string_of_int i |] in
+  match Unix.fork () with
+  | 0 -> (* Child process *)
+      Unix.execvp command args
+  | pid -> (* Parent process *)
+      Printf.printf "Spawned server %d with PID %d\n" i pid;
+      pid
+
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
   let open Ocaml_protoc_plugin in
   let open Kvstore in
   let decode, encode = Service.make_service_functions FrontEnd.startRaft in
-  let request = Reader.create buffer |> decode in
-  match request with
-  | Ok v ->
+  let request = 
+    Reader.create buffer |> decode |> function
+    | Ok v ->
       Printf.printf "Received StartRaft request with arg: %d\n" v;
-      let reply = FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" () in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-  | Error e -> failwith (Printf.sprintf "Error decoding StartRaft request: %s" (Result.show_error e))
+      v
+    | Error e -> failwith (Printf.sprintf "Error decoding StartRaft request: %s" (Result.show_error e))
+  in
+  num_servers := request;
+  for i = 1 to request do
+    ignore (spawn_server i) (* Spawn each server without waiting *)
+  done;
+  
 
+  let reply = FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" () in
+  Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      
 (* Create FrontEnd service with all RPCs *)
 let frontend_service =
   Server.Service.(
