@@ -1,1 +1,11 @@
-
+(executable
+ (name test_frontend_get)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  kvstore
+  h2
+  h2-lwt-unix))

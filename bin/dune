@@ -10,3 +10,16 @@
   h2
   h2-lwt-unix))
 
+(executable
+ (name server)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  kvstore
+  h2
+  h2-lwt-unix))
+
+
