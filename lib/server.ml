@@ -92,24 +92,50 @@ let server =
     v ()
     |> add_service ~name:"kvstore.KeyValueStore" ~service:key_value_store_service)
 
+
+(* Election timeout function that checks follower status and initiates election if needed *)
+let election_timeout () =
+  let open Lwt.Syntax in
+  let timeout_duration = 0.15 +. (Random.float (0.3 -. 0.15)) in(* Random float between 0.15 and 0.3 *)
+  Printf.printf "Election timeout set to %f seconds\n" timeout_duration;
+  flush stdout;
+  let* () = Lwt_unix.sleep timeout_duration in
+  if !role = "follower" then (
+    print_endline "Election timeout reached, starting election...";
+    (* send_request_vote_rpc ();  Placeholder for your election start logic *)
+  );
+  Lwt.return()
+
 let () =
   let open Lwt.Syntax in
   let id = Sys.argv.(1) |> int_of_string in
   num_servers := Sys.argv.(2) |> int_of_string;
+
+  (* Seed the random number generator differently for each instance *)
+  Random.self_init ();
+  Random.init ((Unix.time () |> int_of_float) + id);
+
   let port = 9000 + id in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
   let server_name = Printf.sprintf "raftserver%d" id in
+
+  (* Start the server *)
   Lwt.async (fun () ->
-      let server =
-        H2_lwt_unix.Server.create_connection_handler ?config:None
-          ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
-          ~error_handler:(fun _ ?request:_ _ _ -> print_endline "an error occurred")
-      in
-      let+ _server =
-        Lwt_io.establish_server_with_client_socket listen_address server
-      in
-      Printf.printf "Server %s listening on port %i for grpc requests\n" server_name port;
-      flush stdout);
+    let server =
+      H2_lwt_unix.Server.create_connection_handler ?config:None
+        ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
+        ~error_handler:(fun _ ?request:_ _ _ -> print_endline "an error occurred")
+    in
+    let+ _server =
+      Lwt_io.establish_server_with_client_socket listen_address server
+    in
+    Printf.printf "Server %s listening on port %i for grpc requests\n" server_name port;
+    flush stdout);
+
+  (* Initialize as follower and start election timeout asynchronously *)
   role := "follower";
+  Lwt.async election_timeout;
+
+  (* Keep the server running *)
   let forever, _ = Lwt.wait () in
-  Lwt_main.run forever
+  Lwt_main.run forever;
