@@ -2,6 +2,13 @@
 open Grpc_lwt
 open Kvstore
 
+(* Global Vars *)
+let num_servers = ref 0
+let role = ref "follower"
+
+
+
+
 (* Handle GetState *)
 let handle_get_state_request buffer =
   let open Ocaml_protoc_plugin in
@@ -71,6 +78,7 @@ let server =
 let () =
   let open Lwt.Syntax in
   let id = Sys.argv.(1) |> int_of_string in
+  num_servers := Sys.argv.(2) |> int_of_string;
   let port = 9000 + id in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
   let server_name = Printf.sprintf "raftserver%d" id in
