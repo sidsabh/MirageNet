@@ -61,6 +61,22 @@ let handle_replace_request buffer =
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding Replace request: %s" (Result.show_error e))
 
+(* RAFT CORE *)
+
+(* Handle RequestVoteRPC *)
+let handle_request_vote buffer =
+  let open Ocaml_protoc_plugin in
+  let open Kvstore in
+  let decode, encode = Service.make_service_functions KeyValueStore.requestVote in
+  let request = Reader.create buffer |> decode in
+  match request with
+  | Ok v ->
+      Printf.printf "Received RequestVote request:\n{\n\t\"candidate_id\": %d\n\t\"term\": %d\n\t\"last_log_index\": %d\n\t\"last_log_term\": %d\n}\n" v.candidate_id v.term v.last_log_index v.last_log_term;
+      flush stdout;
+      let reply = KeyValueStore.RequestVote.Response.make ~vote_granted:false ~term:0 () in
+      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+  | Error e -> failwith (Printf.sprintf "Error decoding RequestVote request: %s" (Result.show_error e))
+
 let key_value_store_service =
   Server.Service.(
     v ()
@@ -68,6 +84,7 @@ let key_value_store_service =
     |> add_rpc ~name:"Get" ~rpc:(Unary handle_get_request)
     |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
     |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
+    |> add_rpc ~name:"RequestVote" ~rpc:(Unary handle_request_vote)
     |> handle_request)
 
 let server =
@@ -93,5 +110,6 @@ let () =
       in
       Printf.printf "Server %s listening on port %i for grpc requests\n" server_name port;
       flush stdout);
+  role := "follower";
   let forever, _ = Lwt.wait () in
   Lwt_main.run forever

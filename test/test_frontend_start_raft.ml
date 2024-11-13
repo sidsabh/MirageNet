@@ -5,14 +5,13 @@ open Grpc_lwt
 let call_server address port =
   (* Setup Http/2 connection *)
   Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
->>= fun addresses ->
-let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
->>= fun () ->
-let error_handler _ = print_endline "error" in
-H2_lwt_unix.Client.create_connection ~error_handler socket
->>= fun connection ->
-(* Continue with the rest of your code using `connection` *)
+  >>= fun addresses ->
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+  >>= fun () ->
+  let error_handler _ = print_endline "error" in
+  H2_lwt_unix.Client.create_connection ~error_handler socket
+  >>= fun connection ->
 
 
   (* code generation *)

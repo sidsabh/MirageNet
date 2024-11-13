@@ -58,8 +58,8 @@ let handle_replace_request buffer =
 (* spawn server processes *)
 let spawn_server i =
   let command = Printf.sprintf 
-    "./bin/server %d 2>&1 | awk '{print \"raftserver%d: \" $0; fflush()}' >> raft.log &"
-    i i in
+    "./bin/server %d %d 2>&1 | awk '{print \"raftserver%d: \" $0; fflush()}' >> raft.log &"
+    i !num_servers i in
   ignore (Sys.command command)
 
 
