@@ -84,6 +84,6 @@ let () =
         Lwt_io.establish_server_with_client_socket listen_address server
       in
       Printf.printf "Server %s listening on port %i for grpc requests\n" server_name port;
-      print_endline "Press Ctrl+C to stop");
+      flush stdout);
   let forever, _ = Lwt.wait () in
   Lwt_main.run forever

@@ -19,7 +19,7 @@ let handle_get_request buffer =
   in
 
   Printf.printf "Received Get request:\n{\n\t\"key\": \"%s\"\n\t\"ClientId\": %d\n\t\"RequestId\": %d\n}" request.key request.clientId request.requestId;
-  print_endline "";
+  flush stdout;
 
   let value = "Not Initialized" in
 
@@ -57,14 +57,12 @@ let handle_replace_request buffer =
 
 (* spawn server processes *)
 let spawn_server i =
-  let command = "dune" in
-  let args = [| "dune"; "exec"; "bin/server.exe"; string_of_int i |] in
-  match Unix.fork () with
-  | 0 -> (* Child process *)
-      Unix.execvp command args
-  | pid -> (* Parent process *)
-      Printf.printf "Spawned server %d with PID %d\n" i pid;
-      pid
+  let command = Printf.sprintf 
+    "./bin/server %d 2>&1 | awk '{print \"raftserver%d: \" $0; fflush()}' >> raft.log &"
+    i i in
+  ignore (Sys.command command)
+
+
 
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
@@ -75,12 +73,13 @@ let handle_start_raft_request buffer =
     Reader.create buffer |> decode |> function
     | Ok v ->
       Printf.printf "Received StartRaft request with arg: %d\n" v;
+      flush stdout;
       v
     | Error e -> failwith (Printf.sprintf "Error decoding StartRaft request: %s" (Result.show_error e))
   in
   num_servers := request;
   for i = 1 to request do
-    ignore (spawn_server i) (* Spawn each server without waiting *)
+    ignore (spawn_server i)
   done;
   
 
@@ -117,6 +116,6 @@ Lwt.async (fun () ->
       Lwt_io.establish_server_with_client_socket listen_address server
     in
     Printf.printf "Frontend service listening on port %i for grpc requests\n" port;
-    print_endline "Press Ctrl+C to stop");
+    flush stdout);
 let forever, _ = Lwt.wait () in
 Lwt_main.run forever

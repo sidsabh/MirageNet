@@ -47,8 +47,9 @@ let () =
       match res with
       | Ok (res, _) -> 
           let error = res.error in
-          if error == "" then
+          if error = "" then
             print_endline "Raft servers started successfully"
           else
+            print_endline "Error starting Raft servers";
             print_endline error
       | Error _ -> print_endline "an error occurred")

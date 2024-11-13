@@ -1,6 +1,7 @@
 (executable
  (name frontend)
  (modules frontend)
+ (modes native)
  (libraries
   grpc
   grpc-lwt
@@ -14,6 +15,7 @@
 (executable
  (name server)
  (modules server)
+ (modes native)
  (libraries
   grpc
   grpc-lwt
@@ -23,6 +25,7 @@
   kvstore
   h2
   h2-lwt-unix))
+
 
 
 
