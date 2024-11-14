@@ -8,12 +8,14 @@ open Lwt.Infix
 let id = ref 0
 let num_servers = ref 0
 let role = ref "follower"
-let prev_role = ref "follower"
 let term = ref 0
 let voted_for = ref 0
 let votes_received : int list ref = ref []
 let last_log_index = ref 0
 let last_log_term = ref 0
+let log : Kvstore.LogEntry.t list ref = ref []
+let messages_recieved = ref false
+let leader_id = ref 0
 
 
 
@@ -114,6 +116,38 @@ let handle_request_vote buffer =
   | Error e -> 
       failwith (Printf.sprintf "Error decoding RequestVote request: %s" (Result.show_error e))
 
+(* Condition variable to signal the election loop when timeout occurs *)
+let election_timeout_condition = Lwt_condition.create ()
+
+(* Function to spawn and manage the election timeout *)
+let start_election_timeout () =
+  let rec loop () =
+    (* Generate a random election timeout duration between 0.15s and 0.3s *)
+    let timeout_duration = 0.15 +. (Random.float (0.3 -. 0.15)) in
+    Printf.printf "Election timeout set to %f seconds\n" timeout_duration;
+    flush stdout;
+
+    (* Create a new timeout *)
+    Lwt_unix.sleep timeout_duration >>= fun () ->
+
+    (* After the timeout, check whether a message was received *)
+    if not !messages_recieved then (
+      (* If no message was received, signal the election timeout condition *)
+      Lwt_condition.signal election_timeout_condition ();
+      Lwt.return ()  (* Return unit to complete the monadic flow *)
+    )
+    else (
+      (* If a message was received, reset the flag and restart the loop *)
+      messages_recieved := false;
+      loop ()  (* Recursively call loop to restart the timeout *)
+    )
+    
+  in
+  loop ()  (* Start the loop initially *)
+
+
+
+
 (* Handle AppendEntriesRPC *)
 let handle_append_entries buffer =
   let open Ocaml_protoc_plugin in
@@ -144,6 +178,24 @@ let handle_append_entries buffer =
       (String.concat ", " (List.map log_entry_to_string req_entries))
        req_leader_commit;
     flush stdout;
+
+    if req_leader_id = !leader_id && req_term = !term then (
+      messages_recieved := true;
+    )
+    else if req_term >= !term then (
+      term := req_term;
+      leader_id := req_leader_id;
+      role := "follower";
+      messages_recieved := true;
+      voted_for := 0;
+      votes_received := [];
+      last_log_index := req_prev_log_index;
+      last_log_term := req_prev_log_term;
+      log := req_entries;
+      Printf.printf "Leader %d recognized, term updated to %d\n" req_leader_id req_term;
+      flush stdout;
+    );
+   
     
     let reply = KeyValueStore.AppendEntries.Response.make () in
     Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
@@ -169,18 +221,44 @@ let server =
     |> add_service ~name:"kvstore.KeyValueStore" ~service:key_value_store_service)
 
 
-(* Condition variable to signal the election loop when timeout occurs *)
-let election_timeout_condition = Lwt_condition.create ()
 
-(* Function to spawn and manage the election timeout *)
-let start_election_timeout () =
-  let timeout_duration = 0.15 +. (Random.float (0.3 -. 0.15)) in
-  Printf.printf "Election timeout set to %f seconds\n" timeout_duration;
-  flush stdout;
-  (* Wait for the timeout duration and then signal the condition variable *)
-  let+ () = Lwt_unix.sleep timeout_duration in
-  Lwt_condition.signal election_timeout_condition ()
 
+(* Call AppendEntriesRPC *)
+let call_append_entries address port term leader_id prev_log_index prev_log_term heartbeat leader_commit =
+  (* Setup Http/2 connection for RequestVote RPC *)
+  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
+  >>= fun addresses ->
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+  >>= fun () ->
+  let error_handler _ = print_endline "error" in
+  H2_lwt_unix.Client.create_connection ~error_handler socket
+  >>= fun connection ->
+
+  (* code generation for RequestVote RPC *)
+  let open Ocaml_protoc_plugin in
+  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.appendEntries in
+  let entries = if heartbeat then [] else !log in
+  let req = Kvstore.AppendEntriesRequest.make ~term ~leader_id ~prev_log_index ~prev_log_term ~entries ~leader_commit () in 
+  let enc = encode req |> Writer.contents in
+
+  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"AppendEntries"
+    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+    ~handler:
+      (Client.Rpc.unary enc ~f:(fun decoder ->
+            let+ decoder = decoder in
+            match decoder with
+            | Some decoder -> (
+                Reader.create decoder |> decode |> function
+                | Ok v -> v
+                | Error e ->
+                    failwith
+                      (Printf.sprintf "Could not decode request: %s"
+                        (Result.show_error e)))
+            | None -> Kvstore.KeyValueStore.AppendEntries.Response.make ()))
+    ()
+
+(* Call RequestVoteRPC *)
 let call_request_vote address port candidate_id term last_log_index last_log_term =
   
   (* Setup Http/2 connection for RequestVote RPC *)
@@ -212,16 +290,48 @@ let call_request_vote address port candidate_id term last_log_index last_log_ter
                 | Error e -> failwith (Printf.sprintf "Could not decode request: %s" (Result.show_error e)))
             | None -> Kvstore.KeyValueStore.RequestVote.Response.make ()))
     ()
+
+
+let send_heartbeats () =
+  let all_server_ids = List.init !num_servers (fun i -> i + 1) in
+  List.iter (fun server_id ->
+    if server_id <> !id then (* Don't request a vote from yourself *)
+      Lwt.async (fun () ->
+        let address = "localhost" in
+        let port = 9000 + server_id in
+        let term = !term in
+        call_append_entries address port term !id 0 0 true 0 >>= fun res ->
+        match res with
+        | Ok _ -> 
+            Printf.printf "Heartbeat to server %d successful\n" server_id;
+            Lwt.return()
+        | Error _ -> 
+            Printf.printf "Heartbeat to server %d failed\n" server_id;
+            Lwt.return()
+      )
+  ) all_server_ids;
+  Lwt.return()
+
+  let rec heartbeat_loop () =
+    Lwt_unix.sleep 0.1 >>= fun () ->  (* Sleep for 100ms *)
+    send_heartbeats () >>= fun () ->  (* Send heartbeat to all servers *)
+    heartbeat_loop ()  
+    (* Lwt.return() *)
   
-  
+
+
+
 (* This function handles the request vote and counting the votes *)
 let count_votes () =
   (* Check if we have enough votes for a majority *)
   let total_servers = !num_servers in
   let majority = total_servers / 2 + 1 in
-  if List.length !votes_received >= majority then
+  if List.length !votes_received >= majority then (
     (* If we've received a majority, we win the election *)
-    Printf.printf "We have a majority of votes (%d/%d).\n" (List.length !votes_received) total_servers
+    Printf.printf "We have a majority of votes (%d/%d).\n" (List.length !votes_received) total_servers;
+    role := "leader";
+    Lwt.async (fun () -> heartbeat_loop ())
+  )
   else
     (* Otherwise, we need to continue gathering votes *)
     Printf.printf "Votes received: %d, still need more votes.\n" (List.length !votes_received)
@@ -247,7 +357,8 @@ let send_request_vote_rpcs () =
             Printf.printf "Vote from raftserver%d: %b, term: %d\n" server_id vote_granted ret_term;
             if vote_granted && not (List.mem server_id !votes_received) then begin
               votes_received := server_id :: !votes_received;
-              count_votes ();
+              if !role = "candidate" then
+                count_votes ();
             end;
             Lwt.return ()  (* Properly return unit Lwt.t *)
         | Error _ -> 
@@ -256,6 +367,7 @@ let send_request_vote_rpcs () =
       )
   ) all_server_ids;
   Lwt.return()
+
 
 
 
@@ -322,7 +434,6 @@ let () =
 
   (* Initialize as follower *)
   role := "follower";
-  prev_role := "follower";
 
   (* Start election timeout *)
   Lwt.async election_loop;
