@@ -114,6 +114,44 @@ let handle_request_vote buffer =
   | Error e -> 
       failwith (Printf.sprintf "Error decoding RequestVote request: %s" (Result.show_error e))
 
+(* Handle AppendEntriesRPC *)
+let handle_append_entries buffer =
+  let open Ocaml_protoc_plugin in
+  let open Kvstore in
+  let log_entry_to_string (entry: Kvstore.LogEntry.t) =
+    Printf.sprintf "\n\t\t{\n\t\t\t\"term\": %d\n\t\t\t\"command\": \"%s\"\n\t\t}" entry.term entry.command
+  in
+  let decode, encode = Service.make_service_functions KeyValueStore.appendEntries in
+  let request = Reader.create buffer |> decode in
+  match request with
+  | Ok v ->
+    let req_term = v.term in
+    let req_leader_id = v.leader_id in
+    let req_prev_log_index = v.prev_log_index in
+    let req_prev_log_term = v.prev_log_term in
+    let req_entries = v.entries in
+    let req_leader_commit = v.leader_commit in
+    
+    Printf.printf "Received AppendEntries request:\n{\n\
+                   \t\"term\": %d\n\
+                   \t\"leader_id\": %d\n\
+                   \t\"prev_log_index\": %d\n\
+                   \t\"prev_log_term\": %d\n\
+                    \t\"entries\": [%s\n\t]\n\
+                   \t\"leader_commit\": %d\n\
+                   }\n"
+      req_term req_leader_id req_prev_log_index req_prev_log_term
+      (String.concat ", " (List.map log_entry_to_string req_entries))
+       req_leader_commit;
+    flush stdout;
+    
+    let reply = KeyValueStore.AppendEntries.Response.make () in
+    Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+
+  | Error e -> 
+      failwith (Printf.sprintf "Error decoding AppendEntries request: %s" (Result.show_error e))
+
+
 let key_value_store_service =
   Server.Service.(
     v ()
@@ -122,6 +160,7 @@ let key_value_store_service =
     |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
     |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
     |> add_rpc ~name:"RequestVote" ~rpc:(Unary handle_request_vote)
+    |> add_rpc ~name:"AppendEntries" ~rpc:(Unary handle_append_entries)
     |> handle_request)
 
 let server =
