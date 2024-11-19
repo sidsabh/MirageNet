@@ -4,6 +4,17 @@ open Kvstore
 open Lwt.Syntax
 open Lwt.Infix
 
+type append_entry_state = {
+  mutable successful_replies : int;
+  majority_condition : unit Lwt_condition.t;
+}
+
+let create_append_entry_state () = {
+  successful_replies = 0;
+  majority_condition = Lwt_condition.create ();
+}
+
+
 (* Global Vars *)
 let id = ref 0
 let num_servers = ref 0
@@ -15,6 +26,8 @@ let commit_index = ref 0
 let log : Kvstore.LogEntry.t list ref = ref []
 let messages_recieved = ref false
 let leader_id = ref 0
+
+(* Handle all requests *)
 
 
 
@@ -156,7 +169,7 @@ let handle_append_entries buffer =
     let req_leader_commit = v.leader_commit in
 
     let return = ref false in
-    let success = ref false in
+    let success = ref true in
 
     if req_entries = [] then (
       (* Heartbeat *)
@@ -203,7 +216,7 @@ let handle_append_entries buffer =
     );
     
     (* Condition 2: Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm *)
-    if not !return && (List.length !log < req_prev_log_index || (List.nth !log req_prev_log_index).term <> req_prev_log_term) then (
+    if not !return && req_prev_log_index <> -1 && (List.length !log <= req_prev_log_index || (List.nth !log req_prev_log_index).term <> req_prev_log_term) then (
       ignore(success := false);
       ignore(return := true);
     );
@@ -252,9 +265,11 @@ let handle_append_entries buffer =
     if not !return then (
       let new_log_length = List.length !log in
       (* TODO: take the new entries from req_entries and append it to log *)
-      if new_log_length < (req_prev_log_index + List.length req_entries) then (
+      if new_log_length < (req_prev_log_index + List.length req_entries + 1) then (
         let new_entries = drop (new_log_length - (req_prev_log_index + 1)) req_entries in
         log := List.concat [!log; new_entries];
+        Printf.printf "New log after appending entries: %s\n" (String.concat ", " (List.map log_entry_to_string !log));
+        flush stdout;
       );
     );
 
@@ -267,6 +282,8 @@ let handle_append_entries buffer =
       );
     );
 
+    
+
     (* Create the response based on our decision *)
 
     let reply = KeyValueStore.AppendEntries.Response.make ~term:!term ~success:!success () in
@@ -277,7 +294,7 @@ let handle_append_entries buffer =
 
 
 (* Call AppendEntriesRPC *)
-let call_append_entries address port entries =
+let call_append_entries address port prev_log_index entries =
   (* Setup Http/2 connection for RequestVote RPC *)
   Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
   >>= fun addresses ->
@@ -291,9 +308,8 @@ let call_append_entries address port entries =
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
   let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.appendEntries in
-  let prev_log_index = if !log = [] then 0 else (List.length !log) - 1 in
-  let prev_log_term = if !log = [] then 0 else (List.nth !log prev_log_index).term in
-  let req = Kvstore.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index:prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
+  let prev_log_term = if prev_log_index < List.length !log && prev_log_index >= 0 then (List.nth !log prev_log_index).term else 0 in
+  let req = Kvstore.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
   let enc = encode req |> Writer.contents in
 
   Client.call ~service:"kvstore.KeyValueStore" ~rpc:"AppendEntries"
@@ -312,6 +328,45 @@ let call_append_entries address port entries =
             | None -> Kvstore.KeyValueStore.AppendEntries.Response.make ()))
     ()
 
+let append_entry index value =
+  (* add entry to log *)
+  let new_log_entry = Kvstore.LogEntry.make ~term:!term ~command:value ~index () in
+  log := List.concat [!log; [new_log_entry]];
+
+  (* setup state for this entry *)
+  let state = create_append_entry_state () in
+
+  (* send out append entries *)
+  let address = "localhost" in
+  let all_server_ids = List.init !num_servers (fun i -> i + 1) in
+  List.iter (fun server_id ->
+    if server_id <> !id then (* Don't request a vote from yourself *)
+      Lwt.async (fun () ->
+        let port = 9000 + server_id in
+        let prev_log_index = List.length !log - 2 in
+        call_append_entries address port prev_log_index [new_log_entry] >>= fun res ->
+        match res with
+        | Ok (v, _) -> 
+          let res_term = v.term in
+          let res_success = v.success in
+          Printf.printf "AppendEntries RPC to server %d successful, term: %d, success: %b\n" server_id res_term res_success;
+          flush stdout;
+          if res_success then (
+            state.successful_replies <- state.successful_replies + 1;
+            if state.successful_replies >= (!num_servers / 2) then
+              Lwt_condition.signal state.majority_condition ();
+          );
+          Lwt.return ()
+        | Error _ -> 
+          Lwt.return ()
+      )
+  ) all_server_ids;
+  
+  (* wait for majority of servers to reply *)
+  let* () = Lwt_condition.wait state.majority_condition in
+  Lwt.return ()
+
+
 (* Handle Put *)
 let handle_put_request buffer =
   let open Ocaml_protoc_plugin in
@@ -329,20 +384,8 @@ let handle_put_request buffer =
     flush stdout;
 
     let wrong_leader = if !role <> "leader" then true else (
-      (* add entry to log *)
       let index = List.length !log in
-      let new_log_entry = Kvstore.LogEntry.make ~term:!term ~command:req_value ~index () in
-      log := List.concat [!log; [new_log_entry]];
-
-      (* send out append entries *)
-      let address = "localhost" in
-      let all_server_ids = List.init !num_servers (fun i -> i + 1) in
-      List.iter (fun server_id ->
-        if server_id <> !id then
-          let port = 9000 + server_id in
-          ignore(call_append_entries address port []);
-        ()
-      ) all_server_ids;
+      ignore(append_entry index req_value);
       false
     ) in
     
@@ -392,7 +435,8 @@ let send_heartbeats () =
       Lwt.async (fun () ->
         let address = "localhost" in
         let port = 9000 + server_id in
-        call_append_entries address port [] >>= fun res ->
+        let prev_log_index = List.length !log - 1 in
+        call_append_entries address port prev_log_index [] >>= fun res ->
         match res with
         | Ok _ -> 
             (* Printf.printf "Heartbeat to server %d successful\n" server_id; *)
