@@ -2,7 +2,7 @@
 open Grpc_lwt
 open Lwt.Infix
 open Lwt.Syntax
-open Kvstore
+open Raftkv
 
 (* Global vars *)
 let num_servers = ref 0
@@ -11,7 +11,7 @@ let leader_id = ref 1
 (* Decode the incoming GetKey request *)
 let handle_get_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions FrontEnd.get in
 
   let request =
@@ -44,11 +44,11 @@ let call_server_put address server_id key value client_id request_id =
 
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
-  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.put in
-  let req = Kvstore.KeyValue.make ~key ~value ~clientId: client_id ~requestId: request_id () in 
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.put in
+  let req = Raftkv.KeyValue.make ~key ~value ~clientId: client_id ~requestId: request_id () in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"Put"
+  Grpc_lwt.Client.call ~service:"raftkv.KeyValueStore" ~rpc:"Put"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -61,7 +61,7 @@ let call_server_put address server_id key value client_id request_id =
                     failwith
                       (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Kvstore.KeyValueStore.Put.Response.make ()))
+            | None -> Raftkv.KeyValueStore.Put.Response.make ()))
     ()
   
 
@@ -94,7 +94,7 @@ let send_put_request_to_leader address key value clientId requestId =
 (* Handle Put *)
 let handle_put_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions FrontEnd.put in
   let request = Reader.create buffer |> decode in
   match request with
@@ -122,7 +122,7 @@ let handle_put_request buffer =
 (* Handle Replace *)
 let handle_replace_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions FrontEnd.replace in
   let request = Reader.create buffer |> decode in
   match request with
@@ -144,7 +144,7 @@ let spawn_server i =
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions FrontEnd.startRaft in
   let request = 
     Reader.create buffer |> decode |> function
@@ -166,7 +166,7 @@ let handle_start_raft_request buffer =
 (* Create FrontEnd service with all RPCs *)
 let frontend_service =
   Server.Service.(
-    v () 
+    v ()
     |> add_rpc ~name:"Get" ~rpc:(Unary handle_get_request)
     |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
     |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
@@ -176,23 +176,26 @@ let frontend_service =
 let server =
   Server.(
     v ()
-    |> add_service ~name:"kvstore.FrontEnd" ~service:frontend_service)
-
+    |> add_service ~name:"raftkv.FrontEnd" ~service:frontend_service)
 
 let () =
-let open Lwt.Syntax in
-let port = 8001 in
-let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
-Lwt.async (fun () ->
-    let server =
-      H2_lwt_unix.Server.create_connection_handler ?config:None
-        ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
-        ~error_handler:(fun _ ?request:_ _ _ -> print_endline "an error occurred")
-    in
-    let+ _server =
-      Lwt_io.establish_server_with_client_socket listen_address server
-    in
-    Printf.printf "Frontend service listening on port %i for grpc requests\n" port;
-    flush stdout);
-let forever, _ = Lwt.wait () in
-Lwt_main.run forever
+  let open Lwt.Syntax in
+  let port = 8001 in
+  let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+
+  Lwt.async (fun () ->
+      let server =
+        H2_lwt_unix.Server.create_connection_handler ?config:None
+          ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
+          ~error_handler:(fun _ ?request:_ _ _ ->
+            print_endline "an error occurred")
+      in
+      let+ _server =
+        Lwt_io.establish_server_with_client_socket listen_address server
+      in
+      Printf.printf "Frontend service listening on port %i for grpc requests\n" port;
+      flush stdout);
+
+  let forever, _ = Lwt.wait () in
+  Lwt_main.run forever
+

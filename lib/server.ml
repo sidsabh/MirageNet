@@ -1,6 +1,6 @@
 (* server.ml *)
 open Grpc_lwt
-open Kvstore
+open Raftkv
 open Lwt.Syntax
 open Lwt.Infix
 
@@ -23,7 +23,7 @@ let term = ref 0
 let voted_for = ref 0
 let votes_received : int list ref = ref []
 let commit_index = ref 0
-let log : Kvstore.LogEntry.t list ref = ref []
+let log : Raftkv.LogEntry.t list ref = ref []
 let messages_recieved = ref false
 let leader_id = ref 0
 
@@ -33,7 +33,7 @@ let leader_id = ref 0
 (* Handle GetState *)
 let handle_get_state_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions KeyValueStore.getState in
   let request = Reader.create buffer |> decode in
   match request with
@@ -45,7 +45,7 @@ let handle_get_state_request buffer =
 (* Handle Get *)
 let handle_get_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions KeyValueStore.get in
   let request = Reader.create buffer |> decode in
   match request with
@@ -60,7 +60,7 @@ let handle_get_request buffer =
 (* Handle Replace *)
 let handle_replace_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions KeyValueStore.replace in
   let request = Reader.create buffer |> decode in
   match request with
@@ -75,7 +75,7 @@ let handle_replace_request buffer =
 (* Handle RequestVoteRPC *)
 let handle_request_vote buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions KeyValueStore.requestVote in
   let request = Reader.create buffer |> decode in
   match request with
@@ -150,8 +150,8 @@ let start_election_timeout () =
 (* Handle AppendEntriesRPC *)
 let handle_append_entries buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
-  let log_entry_to_string (entry: Kvstore.LogEntry.t) =
+  let open Raftkv in
+  let log_entry_to_string (entry: Raftkv.LogEntry.t) =
     Printf.sprintf "\n\t\t{\n\t\t\t\"index\": %d\n\t\t\t\"term\": %d\n\t\t\t\"command\": \"%s\"\n\t\t}" entry.index entry.term entry.command
   in
   let decode, encode = Service.make_service_functions KeyValueStore.appendEntries in
@@ -219,10 +219,10 @@ let handle_append_entries buffer =
     );
 
     let truncate_log_if_conflict 
-      (log : Kvstore.LogEntry.t list) 
-      (entries : Kvstore.LogEntry.t list) 
+      (log : Raftkv.LogEntry.t list) 
+      (entries : Raftkv.LogEntry.t list) 
       (prev_log_index : int) 
-      : Kvstore.LogEntry.t list  =
+      : Raftkv.LogEntry.t list  =
       (* Define the starting index *)
       let rec loop i =
         if i >= List.length log || i - prev_log_index - 1 >= List.length entries then
@@ -304,12 +304,12 @@ let call_append_entries address port prev_log_index entries =
 
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
-  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.appendEntries in
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.appendEntries in
   let prev_log_term = if prev_log_index < List.length !log && prev_log_index >= 0 then (List.nth !log prev_log_index).term else 0 in
-  let req = Kvstore.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
+  let req = Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"AppendEntries"
+  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -322,12 +322,12 @@ let call_append_entries address port prev_log_index entries =
                     failwith
                       (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Kvstore.KeyValueStore.AppendEntries.Response.make ()))
+            | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
     ()
 
 let append_entry index value state =
   (* add entry to log *)
-  let new_log_entry = Kvstore.LogEntry.make ~term:!term ~command:value ~index () in
+  let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command:value ~index () in
   log := List.concat [!log; [new_log_entry]];
 
   (* send out append entries *)
@@ -369,7 +369,7 @@ let append_entry index value state =
 (* Handle Put *)
 let handle_put_request buffer =
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
+  let open Raftkv in
   let decode, encode = Service.make_service_functions KeyValueStore.put in
   let request = Reader.create buffer |> decode in
   match request with
@@ -413,11 +413,11 @@ let call_request_vote address port candidate_id term last_log_index last_log_ter
 
   (* Create and send the RequestVote RPC *)
   let open Ocaml_protoc_plugin in
-  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.requestVote in
-  let req = Kvstore.RequestVoteRequest.make ~candidate_id ~term ~last_log_index ~last_log_term () in
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.requestVote in
+  let req = Raftkv.RequestVoteRequest.make ~candidate_id ~term ~last_log_index ~last_log_term () in
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"RequestVote"
+  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"RequestVote"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -427,7 +427,7 @@ let call_request_vote address port candidate_id term last_log_index last_log_ter
                 Reader.create decoder |> decode |> function
                 | Ok v -> v
                 | Error e -> failwith (Printf.sprintf "Could not decode request: %s" (Result.show_error e)))
-            | None -> Kvstore.KeyValueStore.RequestVote.Response.make ()))
+            | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
     ()
 
 
@@ -558,7 +558,7 @@ let key_value_store_service =
 let server =
   Server.(
     v ()
-    |> add_service ~name:"kvstore.KeyValueStore" ~service:key_value_store_service)
+    |> add_service ~name:"raftkv.KeyValueStore" ~service:key_value_store_service)
 
 
 let () =

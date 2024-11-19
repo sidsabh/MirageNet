@@ -15,12 +15,12 @@ let call_request_vote address port =
 
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
-  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.requestVote in
-  let req = Kvstore.RequestVoteRequest.make ~candidate_id:1 ~term:2 ~last_log_index:3 ~last_log_term:4 () in 
+  let open Raftkv in
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.requestVote in
+  let req = Raftkv.RequestVoteRequest.make ~candidate_id:1 ~term:2 ~last_log_index:3 ~last_log_term:4 () in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"RequestVote"
+  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"RequestVote"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -33,7 +33,7 @@ let call_request_vote address port =
                     failwith
                       (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Kvstore.KeyValueStore.RequestVote.Response.make ()))
+            | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
     ()
 
 

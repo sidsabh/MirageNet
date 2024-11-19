@@ -17,12 +17,12 @@ H2_lwt_unix.Client.create_connection ~error_handler socket
 
   (* code generation *)
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
-  let encode, decode = Service.make_client_functions Kvstore.FrontEnd.get in
-  let req = Kvstore.GetKey.make ~key:"1" ~clientId: 2 ~requestId: 3() in 
+  let open Raftkv in
+  let encode, decode = Service.make_client_functions Raftkv.FrontEnd.get in
+  let req = Raftkv.GetKey.make ~key:"1" ~clientId: 2 ~requestId: 3() in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.FrontEnd" ~rpc:"Get"
+  Client.call ~service:"raftkv.FrontEnd" ~rpc:"Get"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -35,7 +35,7 @@ H2_lwt_unix.Client.create_connection ~error_handler socket
                    failwith
                      (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-           | None -> Kvstore.FrontEnd.Get.Response.make ()))
+           | None -> Raftkv.FrontEnd.Get.Response.make ()))
     ()
 
 let () =

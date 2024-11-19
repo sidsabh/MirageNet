@@ -15,16 +15,16 @@ let call_append_entries address port =
 
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
-  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.appendEntries in
+  let open Raftkv in
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.appendEntries in
   let entries = [
-    Kvstore.LogEntry.make ~term:1 ~command:"command1" ();
-    Kvstore.LogEntry.make ~term:1 ~command:"command2" ();
+    Raftkv.LogEntry.make ~term:1 ~command:"command1" ();
+    Raftkv.LogEntry.make ~term:1 ~command:"command2" ();
   ] in
-  let req = Kvstore.AppendEntriesRequest.make ~term:1 ~leader_id:2 ~prev_log_index:3 ~prev_log_term:4 ~entries ~leader_commit:6 () in 
+  let req = Raftkv.AppendEntriesRequest.make ~term:1 ~leader_id:2 ~prev_log_index:3 ~prev_log_term:4 ~entries ~leader_commit:6 () in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"AppendEntries"
+  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -37,7 +37,7 @@ let call_append_entries address port =
                     failwith
                       (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Kvstore.KeyValueStore.AppendEntries.Response.make ()))
+            | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
     ()
 
 

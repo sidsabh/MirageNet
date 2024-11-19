@@ -1,11 +1,11 @@
 (library
- (name kvstore)
+ (name raftkv)
  (libraries ocaml-protoc-plugin))
 
 (rule
- (targets kvstore.ml)
+ (targets raftkv.ml)
  (deps
-  (:proto kvstore.proto))
+  (:proto raftkv.proto))
  (action
   (run
    protoc

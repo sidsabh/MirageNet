@@ -6,7 +6,7 @@
   ocaml-protoc-plugin
   lwt
   lwt.unix
-  kvstore
+  raftkv
   h2
   h2-lwt-unix))
 
@@ -18,7 +18,7 @@
   ocaml-protoc-plugin
   lwt
   lwt.unix
-  kvstore
+  raftkv
   h2
   h2-lwt-unix))
 
@@ -30,7 +30,7 @@
   ocaml-protoc-plugin
   lwt
   lwt.unix
-  kvstore
+  raftkv
   h2
   h2-lwt-unix))
 
@@ -42,7 +42,7 @@
     ocaml-protoc-plugin
     lwt
     lwt.unix
-    kvstore
+    raftkv
     h2
     h2-lwt-unix))
 
@@ -54,7 +54,7 @@
     ocaml-protoc-plugin
     lwt
     lwt.unix
-    kvstore
+    raftkv
     h2
     h2-lwt-unix))
 
@@ -66,6 +66,6 @@
     ocaml-protoc-plugin
     lwt
     lwt.unix
-    kvstore
+    raftkv
     h2
     h2-lwt-unix))

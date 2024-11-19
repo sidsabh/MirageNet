@@ -16,12 +16,12 @@ let call_server address port =
 
   (* code generation *)
   let open Ocaml_protoc_plugin in
-  let open Kvstore in
-  let encode, decode = Service.make_client_functions Kvstore.FrontEnd.startRaft in
-  let req = Kvstore.IntegerArg.make ~arg:3 () in 
+  let open Raftkv in
+  let encode, decode = Service.make_client_functions Raftkv.FrontEnd.startRaft in
+  let req = Raftkv.IntegerArg.make ~arg:3 () in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.FrontEnd" ~rpc:"StartRaft"
+  Client.call ~service:"raftkv.FrontEnd" ~rpc:"StartRaft"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -34,7 +34,7 @@ let call_server address port =
                    failwith
                      (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-           | None -> Kvstore.FrontEnd.StartRaft.Response.make ()))
+           | None -> Raftkv.FrontEnd.StartRaft.Response.make ()))
     ()
 
 let () =
