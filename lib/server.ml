@@ -27,9 +27,6 @@ let log : Kvstore.LogEntry.t list ref = ref []
 let messages_recieved = ref false
 let leader_id = ref 0
 
-(* Handle all requests *)
-
-
 
 
 
@@ -328,13 +325,10 @@ let call_append_entries address port prev_log_index entries =
             | None -> Kvstore.KeyValueStore.AppendEntries.Response.make ()))
     ()
 
-let append_entry index value =
+let append_entry index value state =
   (* add entry to log *)
   let new_log_entry = Kvstore.LogEntry.make ~term:!term ~command:value ~index () in
   log := List.concat [!log; [new_log_entry]];
-
-  (* setup state for this entry *)
-  let state = create_append_entry_state () in
 
   (* send out append entries *)
   let address = "localhost" in
@@ -354,6 +348,13 @@ let append_entry index value =
           if res_success then (
             state.successful_replies <- state.successful_replies + 1;
             if state.successful_replies >= (!num_servers / 2) then
+              (* A log entry is committed once the leader
+              that created the entry has replicated it on a majority of
+              the servers (e.g., entry 7 in Figure 6). This also commits
+              all preceding entries in the leader’s log, including entries
+              created by previous leaders. *)
+              if (!commit_index < index) then
+                commit_index := index;
               Lwt_condition.signal state.majority_condition ();
           );
           Lwt.return ()
@@ -361,9 +362,7 @@ let append_entry index value =
           Lwt.return ()
       )
   ) all_server_ids;
-  
-  (* wait for majority of servers to reply *)
-  let* () = Lwt_condition.wait state.majority_condition in
+
   Lwt.return ()
 
 
@@ -383,14 +382,18 @@ let handle_put_request buffer =
       req_key req_value req_client_id req_request_id;
     flush stdout;
 
-    let wrong_leader = if !role <> "leader" then true else (
+
+    if !role <> "leader" then
+      let reply = KeyValueStore.Put.Response.make ~wrongLeader:true ~error:"" () in
+      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+    else
       let index = List.length !log in
-      ignore(append_entry index req_value);
-      false
-    ) in
+      let state = create_append_entry_state () in
+      let* _ = append_entry index req_value state in
+      let* () = Lwt_condition.wait state.majority_condition in
+      let reply = KeyValueStore.Put.Response.make ~wrongLeader:false ~error:"" () in
+      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
     
-    let reply = KeyValueStore.Put.Response.make ~wrongLeader:wrong_leader ~error:"" () in
-    Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
 
@@ -585,6 +588,7 @@ let () =
 
   (* Initialize as follower *)
   role := "follower";
+  commit_index := -1;
 
   (* Start election timeout *)
   Lwt.async election_loop;
