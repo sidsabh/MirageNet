@@ -11,8 +11,7 @@ let role = ref "follower"
 let term = ref 0
 let voted_for = ref 0
 let votes_received : int list ref = ref []
-let last_log_index = ref 0
-let last_log_term = ref 0
+let commit_index = ref 0
 let log : Kvstore.LogEntry.t list ref = ref []
 let messages_recieved = ref false
 let leader_id = ref 0
@@ -47,18 +46,6 @@ let handle_get_request buffer =
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding Get request: %s" (Result.show_error e))
 
-(* Handle Put *)
-let handle_put_request buffer =
-  let open Ocaml_protoc_plugin in
-  let open Kvstore in
-  let decode, encode = Service.make_service_functions KeyValueStore.put in
-  let request = Reader.create buffer |> decode in
-  match request with
-  | Ok v ->
-      Printf.printf "Received Put request with key: %s and value: %s\n" v.key v.value;
-      let reply = KeyValueStore.Put.Response.make ~wrongLeader:false ~error:"" () in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-  | Error e -> failwith (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
 (* Handle Replace *)
 let handle_replace_request buffer =
@@ -92,9 +79,11 @@ let handle_request_vote buffer =
         req_candidate_id req_term req_last_log_index req_last_log_term;
       flush stdout;
       
+      let log_length = List.length !log in
+      let last_log_term = if log_length = 0 then 0 else (List.nth !log (log_length - 1)).term in
       let log_is_up_to_date = 
-        (req_last_log_term > !last_log_term) || 
-        (req_last_log_term = !last_log_term && req_last_log_index >= !last_log_index)
+        (req_last_log_term > last_log_term) || 
+        (req_last_log_term = last_log_term && req_last_log_index >= log_length - 1)
       in
 
       (* Decide to vote or not *)
@@ -123,15 +112,15 @@ let election_timeout_condition = Lwt_condition.create ()
 let start_election_timeout () =
   let rec loop () =
     (* Generate a random election timeout duration between 0.15s and 0.3s *)
-    let timeout_duration = 0.15 +. (Random.float (0.3 -. 0.15)) in
-    Printf.printf "Election timeout set to %f seconds\n" timeout_duration;
-    flush stdout;
+    let timeout_duration = 0.5 +. (Random.float (1. -. 0.5)) in
+    (* Printf.printf "Election timeout set to %f seconds\n" timeout_duration;
+    flush stdout; *)
 
     (* Create a new timeout *)
     Lwt_unix.sleep timeout_duration >>= fun () ->
 
     (* After the timeout, check whether a message was received *)
-    if not !messages_recieved then (
+    if not !messages_recieved && !role <> "leader" then (
       (* If no message was received, signal the election timeout condition *)
       Lwt_condition.signal election_timeout_condition ();
       Lwt.return ()  (* Return unit to complete the monadic flow *)
@@ -153,7 +142,7 @@ let handle_append_entries buffer =
   let open Ocaml_protoc_plugin in
   let open Kvstore in
   let log_entry_to_string (entry: Kvstore.LogEntry.t) =
-    Printf.sprintf "\n\t\t{\n\t\t\t\"term\": %d\n\t\t\t\"command\": \"%s\"\n\t\t}" entry.term entry.command
+    Printf.sprintf "\n\t\t{\n\t\t\t\"index\": %d\n\t\t\t\"term\": %d\n\t\t\t\"command\": \"%s\"\n\t\t}" entry.index entry.term entry.command
   in
   let decode, encode = Service.make_service_functions KeyValueStore.appendEntries in
   let request = Reader.create buffer |> decode in
@@ -165,66 +154,130 @@ let handle_append_entries buffer =
     let req_prev_log_term = v.prev_log_term in
     let req_entries = v.entries in
     let req_leader_commit = v.leader_commit in
-    
-    Printf.printf "Received AppendEntries request:\n{\n\
-                   \t\"term\": %d\n\
-                   \t\"leader_id\": %d\n\
-                   \t\"prev_log_index\": %d\n\
-                   \t\"prev_log_term\": %d\n\
-                    \t\"entries\": [%s\n\t]\n\
-                   \t\"leader_commit\": %d\n\
-                   }\n"
-      req_term req_leader_id req_prev_log_index req_prev_log_term
-      (String.concat ", " (List.map log_entry_to_string req_entries))
-       req_leader_commit;
-    flush stdout;
 
-    if req_leader_id = !leader_id && req_term = !term then (
-      messages_recieved := true;
-    )
-    else if req_term >= !term then (
-      term := req_term;
-      leader_id := req_leader_id;
-      role := "follower";
-      messages_recieved := true;
-      voted_for := 0;
-      votes_received := [];
-      last_log_index := req_prev_log_index;
-      last_log_term := req_prev_log_term;
-      log := req_entries;
-      Printf.printf "Leader %d recognized, term updated to %d\n" req_leader_id req_term;
+    let return = ref false in
+    let success = ref false in
+
+    if req_entries = [] then (
+      (* Heartbeat *)
+      if req_term > !term || (req_term = !term && req_leader_id <> !leader_id) then (
+        if !role = "leader" then (
+          failwith "Multiple leaders in the same term, aborting";
+        );
+        (* New leader *)
+        term := req_term;
+        leader_id := req_leader_id;
+        role := "follower";
+        messages_recieved := true;
+        voted_for := 0;
+        votes_received := [];
+        Printf.printf "Leader %d recognized, term updated to %d\n" req_leader_id req_term;
+        flush stdout;
+      ) else if req_term = !term && req_leader_id = !leader_id then 
+        (* Heartbeat from current leader *)
+        messages_recieved := true;
+      
+      return := true;
+      success := true;
+    );
+
+    if not !return then (
+      Printf.printf "Received AppendEntries request:\n{\n\
+                    \t\"term\": %d\n\
+                    \t\"leader_id\": %d\n\
+                    \t\"prev_log_index\": %d\n\
+                    \t\"prev_log_term\": %d\n\
+                      \t\"entries\": [%s\n\t]\n\
+                    \t\"leader_commit\": %d\n\
+                    }\n"
+        req_term req_leader_id req_prev_log_index req_prev_log_term
+        (String.concat ", " (List.map log_entry_to_string req_entries))
+        req_leader_commit;
       flush stdout;
     );
-   
+
+    (* Condition 1: Reply false if term < currentTerm *)
+    if req_term < !term then (
+      ignore(success := false);
+      ignore(return := true);
+    );
     
-    let reply = KeyValueStore.AppendEntries.Response.make () in
+    (* Condition 2: Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm *)
+    if not !return && (List.length !log < req_prev_log_index || (List.nth !log req_prev_log_index).term <> req_prev_log_term) then (
+      ignore(success := false);
+      ignore(return := true);
+    );
+
+    let truncate_log_if_conflict 
+      (log : Kvstore.LogEntry.t list) 
+      (entries : Kvstore.LogEntry.t list) 
+      (prev_log_index : int) 
+      : Kvstore.LogEntry.t list  =
+      (* Define the starting index *)
+      let rec loop i =
+        if i >= List.length log || i - prev_log_index - 1 >= List.length entries then
+          (* If out of bounds, stop *)
+          log
+        else
+          let log_term = (List.nth log i).term in
+          let entry_term = (List.nth entries (i - prev_log_index - 1)).term in
+          if log_term <> entry_term then
+            (* If there is a conflict, truncate the log from index i *)
+            List.filteri (fun idx _ -> idx < i) log
+          else
+            (* No conflict, continue to the next index *)
+            loop (i + 1)
+      in
+      loop (prev_log_index + 1)
+    in
+    
+
+    (* Condition 3: If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it *)
+    if not !return then (
+      (* Starting immediatly after prev_log_index, make sure log[i].term = entries[i-prev_log_index].term *)
+      truncate_log_if_conflict !log req_entries req_prev_log_index |> fun new_log ->
+        log := new_log;
+    );
+
+    let rec drop n lst =
+      if n <= 0 then
+        lst  (* No more elements to drop, return the remaining list *)
+      else
+        match lst with
+        | [] -> []  (* If the list is empty, return an empty list *)
+        | _ :: tail -> drop (n - 1) tail  (* Drop one element and recurse *)
+    in    
+
+    (* Condition 4: Append any new entries not already in the log *)
+    if not !return then (
+      let new_log_length = List.length !log in
+      (* TODO: take the new entries from req_entries and append it to log *)
+      if new_log_length < (req_prev_log_index + List.length req_entries) then (
+        let new_entries = drop (new_log_length - (req_prev_log_index + 1)) req_entries in
+        log := List.concat [!log; new_entries];
+      );
+    );
+
+    (* Condition 5: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) *)
+    if not !return then (
+      if req_leader_commit > !commit_index then (
+        let new_log_length = List.length !log in
+        let new_commit_index = min req_leader_commit (new_log_length - 1) in
+        commit_index := new_commit_index;
+      );
+    );
+
+    (* Create the response based on our decision *)
+
+    let reply = KeyValueStore.AppendEntries.Response.make ~term:!term ~success:!success () in
     Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
   | Error e -> 
       failwith (Printf.sprintf "Error decoding AppendEntries request: %s" (Result.show_error e))
 
 
-let key_value_store_service =
-  Server.Service.(
-    v ()
-    |> add_rpc ~name:"GetState" ~rpc:(Unary handle_get_state_request)
-    |> add_rpc ~name:"Get" ~rpc:(Unary handle_get_request)
-    |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
-    |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
-    |> add_rpc ~name:"RequestVote" ~rpc:(Unary handle_request_vote)
-    |> add_rpc ~name:"AppendEntries" ~rpc:(Unary handle_append_entries)
-    |> handle_request)
-
-let server =
-  Server.(
-    v ()
-    |> add_service ~name:"kvstore.KeyValueStore" ~service:key_value_store_service)
-
-
-
-
 (* Call AppendEntriesRPC *)
-let call_append_entries address port term leader_id prev_log_index prev_log_term heartbeat leader_commit =
+let call_append_entries address port entries =
   (* Setup Http/2 connection for RequestVote RPC *)
   Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
   >>= fun addresses ->
@@ -238,8 +291,9 @@ let call_append_entries address port term leader_id prev_log_index prev_log_term
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
   let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.appendEntries in
-  let entries = if heartbeat then [] else !log in
-  let req = Kvstore.AppendEntriesRequest.make ~term ~leader_id ~prev_log_index ~prev_log_term ~entries ~leader_commit () in 
+  let prev_log_index = if !log = [] then 0 else (List.length !log) - 1 in
+  let prev_log_term = if !log = [] then 0 else (List.nth !log prev_log_index).term in
+  let req = Kvstore.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index:prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
   let enc = encode req |> Writer.contents in
 
   Client.call ~service:"kvstore.KeyValueStore" ~rpc:"AppendEntries"
@@ -257,6 +311,45 @@ let call_append_entries address port term leader_id prev_log_index prev_log_term
                         (Result.show_error e)))
             | None -> Kvstore.KeyValueStore.AppendEntries.Response.make ()))
     ()
+
+(* Handle Put *)
+let handle_put_request buffer =
+  let open Ocaml_protoc_plugin in
+  let open Kvstore in
+  let decode, encode = Service.make_service_functions KeyValueStore.put in
+  let request = Reader.create buffer |> decode in
+  match request with
+  | Ok v ->
+    let req_key = v.key in
+    let req_value = v.value in
+    let req_client_id = v.clientId in
+    let req_request_id = v.requestId in
+    Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"clientId\": %d\n\t\"requestId\": %d\n}\n"
+      req_key req_value req_client_id req_request_id;
+    flush stdout;
+
+    let wrong_leader = if !role <> "leader" then true else (
+      (* add entry to log *)
+      let index = List.length !log in
+      let new_log_entry = Kvstore.LogEntry.make ~term:!term ~command:req_value ~index () in
+      log := List.concat [!log; [new_log_entry]];
+
+      (* send out append entries *)
+      let address = "localhost" in
+      let all_server_ids = List.init !num_servers (fun i -> i + 1) in
+      List.iter (fun server_id ->
+        if server_id <> !id then
+          let port = 9000 + server_id in
+          ignore(call_append_entries address port []);
+        ()
+      ) all_server_ids;
+      false
+    ) in
+    
+    let reply = KeyValueStore.Put.Response.make ~wrongLeader:wrong_leader ~error:"" () in
+    Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+  | Error e -> failwith (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
+
 
 (* Call RequestVoteRPC *)
 let call_request_vote address port candidate_id term last_log_index last_log_term =
@@ -299,21 +392,20 @@ let send_heartbeats () =
       Lwt.async (fun () ->
         let address = "localhost" in
         let port = 9000 + server_id in
-        let term = !term in
-        call_append_entries address port term !id 0 0 true 0 >>= fun res ->
+        call_append_entries address port [] >>= fun res ->
         match res with
         | Ok _ -> 
-            Printf.printf "Heartbeat to server %d successful\n" server_id;
+            (* Printf.printf "Heartbeat to server %d successful\n" server_id; *)
             Lwt.return()
         | Error _ -> 
-            Printf.printf "Heartbeat to server %d failed\n" server_id;
+            (* Printf.printf "Heartbeat to server %d failed\n" server_id; *)
             Lwt.return()
       )
   ) all_server_ids;
   Lwt.return()
 
   let rec heartbeat_loop () =
-    Lwt_unix.sleep 0.1 >>= fun () ->  (* Sleep for 100ms *)
+    Lwt_unix.sleep 0.3 >>= fun () ->  (* Sleep for 100ms *)
     send_heartbeats () >>= fun () ->  (* Send heartbeat to all servers *)
     heartbeat_loop ()  
     (* Lwt.return() *)
@@ -346,15 +438,17 @@ let send_request_vote_rpcs () =
         let port = 9000 + server_id in
         let candidate_id = !id in
         let term = !term in
-        let last_log_index = !last_log_index in
-        let last_log_term = !last_log_term in
+        let log_length = List.length !log in
+        let last_log_index = if log_length = 0 then 0 else log_length - 1 in
+        let last_log_term = if log_length = 0 then 0 else (List.nth !log last_log_index).term in
         call_request_vote address port candidate_id term last_log_index last_log_term >>= fun res ->
         match res with
         | Ok (res, _) -> 
-            Printf.printf "RequestVote RPC to server %d successful\n" server_id;
+            (* Printf.printf "RequestVote RPC to server %d successful\n" server_id; *)
             let ret_term = res.term in
             let vote_granted = res.vote_granted in
             Printf.printf "Vote from raftserver%d: %b, term: %d\n" server_id vote_granted ret_term;
+            flush stdout;
             if vote_granted && not (List.mem server_id !votes_received) then begin
               votes_received := server_id :: !votes_received;
               if !role = "candidate" then
@@ -379,7 +473,7 @@ let election_loop () =
   let _ = start_election_timeout () in
 
   (* Main election loop *)
-  let loop () =
+  let rec loop () =
     (* Wait for the election timeout to complete *)
     let* () = Lwt_condition.wait election_timeout_condition in
 
@@ -398,13 +492,26 @@ let election_loop () =
 
     (* Send RequestVote RPCs to other servers asynchronously *)
     Lwt.async (fun () -> send_request_vote_rpcs ());
-    Lwt.return()
     (* Continue the loop *)
-    (* loop () *)
+    loop ()
   in
   loop ()
  
+let key_value_store_service =
+  Server.Service.(
+    v ()
+    |> add_rpc ~name:"GetState" ~rpc:(Unary handle_get_state_request)
+    |> add_rpc ~name:"Get" ~rpc:(Unary handle_get_request)
+    |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
+    |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
+    |> add_rpc ~name:"RequestVote" ~rpc:(Unary handle_request_vote)
+    |> add_rpc ~name:"AppendEntries" ~rpc:(Unary handle_append_entries)
+    |> handle_request)
 
+let server =
+  Server.(
+    v ()
+    |> add_service ~name:"kvstore.KeyValueStore" ~service:key_value_store_service)
 
 
 let () =

@@ -52,8 +52,9 @@ message RequestVoteResponse {
 }
 
 message LogEntry {
-  int32 term = 1;
-  string command = 2; // Represents a command or data in the entry
+  int32 index = 1;
+  int32 term = 2;
+  string command = 3; // Represents a command or data in the entry
 }
 
 message AppendEntriesRequest {

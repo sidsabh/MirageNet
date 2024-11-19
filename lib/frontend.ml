@@ -1,9 +1,12 @@
 (* frontend.ml *)
 open Grpc_lwt
+open Lwt.Infix
+open Lwt.Syntax
 open Kvstore
 
 (* Global vars *)
 let num_servers = ref 0
+let leader_id = ref 1
 
 (* Decode the incoming GetKey request *)
 let handle_get_request buffer =
@@ -26,6 +29,68 @@ let handle_get_request buffer =
   let reply = FrontEnd.Get.Response.make ~wrongLeader:false ~error:"" ~value () in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
+(* Call server put *)
+let call_server_put address server_id key value client_id request_id =
+  (* Setup Http/2 connection for RequestVote RPC *)
+  let port = 9000 + server_id in
+  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
+  >>= fun addresses ->
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+  >>= fun () ->
+  let error_handler _ = print_endline "error" in
+  H2_lwt_unix.Client.create_connection ~error_handler socket
+  >>= fun connection ->
+
+  (* code generation for RequestVote RPC *)
+  let open Ocaml_protoc_plugin in
+  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.put in
+  let req = Kvstore.KeyValue.make ~key ~value ~clientId: client_id ~requestId: request_id () in 
+  let enc = encode req |> Writer.contents in
+
+  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"Put"
+    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+    ~handler:
+      (Client.Rpc.unary enc ~f:(fun decoder ->
+            let+ decoder = decoder in
+            match decoder with
+            | Some decoder -> (
+                Reader.create decoder |> decode |> function
+                | Ok v -> v
+                | Error e ->
+                    failwith
+                      (Printf.sprintf "Could not decode request: %s"
+                        (Result.show_error e)))
+            | None -> Kvstore.KeyValueStore.Put.Response.make ()))
+    ()
+  
+
+let send_put_request_to_leader address key value clientId requestId =
+  let rec loop () =
+    call_server_put address !leader_id key value clientId requestId >>= fun res ->
+    match res with
+    | Ok (res, _) -> 
+      let wrong_leader = res.wrongLeader in
+      let _error = res.error in
+      let value = res.value in
+      if wrong_leader then (
+        leader_id := !leader_id + 1;
+        Printf.printf "Leader is wrong, trying raftserver%d\n" !leader_id;
+        flush stdout;
+        loop ()
+      ) else (
+        Printf.printf "Put RPC to server %d successful, value: %s\n" !leader_id value;
+        flush stdout;
+        Lwt.return res
+      )
+    | Error _ -> 
+      Printf.printf "Put RPC to server %d failed, trying next server\n" !leader_id;
+      flush stdout;
+      leader_id := !leader_id + 1;
+      loop ()
+  in
+  loop ()
+
 (* Handle Put *)
 let handle_put_request buffer =
   let open Ocaml_protoc_plugin in
@@ -34,12 +99,24 @@ let handle_put_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
+    let key = v.key in
+    let value = v.value in
+    let clientId = v.clientId in
+    let requestId = v.requestId in
 
-      Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"ClientId\": %d\n\t\"RequestId\": %d\n}" v.key v.value v.clientId v.requestId;
-      print_endline "";
+    Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"ClientId\": %d\n\t\"RequestId\": %d\n}\n" key value clientId requestId;
+    flush stdout;
 
-      let reply = FrontEnd.Put.Response.make ~wrongLeader:false ~error:"" ~value:"Not Initialized"() in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+    (* Find the leader *)
+    let* res = send_put_request_to_leader "localhost" key value clientId requestId in
+    let res_wrong_leader = res.wrongLeader in
+    let res_error = res.error in
+    let res_value = res.value in
+    
+    (* Reply to the client *)
+    
+    let reply = FrontEnd.Put.Response.make ~wrongLeader:res_wrong_leader ~error:res_error ~value:res_value() in
+    Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
 (* Handle Replace *)

@@ -16,11 +16,11 @@ let call_request_vote address port =
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
   let open Kvstore in
-  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.requestVote in
-  let req = Kvstore.RequestVoteRequest.make ~candidate_id:1 ~term:2 ~last_log_index:3 ~last_log_term:4 () in 
+  let encode, decode = Service.make_client_functions Kvstore.KeyValueStore.put in
+  let req = Kvstore.KeyValue.make ~key:"1" ~value:"test_command" ~clientId: 2 ~requestId: 3 () in 
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"RequestVote"
+  Client.call ~service:"kvstore.KeyValueStore" ~rpc:"Put"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -33,7 +33,7 @@ let call_request_vote address port =
                     failwith
                       (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Kvstore.KeyValueStore.RequestVote.Response.make ()))
+            | None -> Kvstore.KeyValueStore.Put.Response.make ()))
     ()
 
 
@@ -45,8 +45,8 @@ let () =
     (let+ res = call_request_vote address port in
       match res with
       | Ok (res, _) -> 
-          let term = res.term in
-          let voteGranted = res.vote_granted in
-          Printf.printf "Received RequestVote response:\n{\n\t\"term\": %d\n\t\"voteGranted\": %b\n}\n" term voteGranted;
-          flush stdout
+        let wrong_leader = res.wrongLeader in
+        let error = res.error in
+        let value = res.value in
+        Printf.printf "Received Put response:\n{\n\t\"wrongLeader\": %b\n\t\"error\": \"%s\"\n\t\"value\": \"%s\"\n}" wrong_leader error value;
       | Error _ -> print_endline "an error occurred")
