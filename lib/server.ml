@@ -38,7 +38,10 @@ let handle_get_state_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok _ ->
-      let reply = KeyValueStore.GetState.Response.make ~term:1 ~isLeader:true () in
+      Printf.printf "Received GetState request\n";
+      flush stdout;
+      let is_leader = !role = "leader" in
+      let reply = KeyValueStore.GetState.Response.make ~term:!term ~isLeader:is_leader () in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding GetState request: %s" (Result.show_error e))
 
@@ -132,11 +135,13 @@ let start_election_timeout () =
     (* After the timeout, check whether a message was received *)
     if not !messages_recieved && !role <> "leader" then (
       (* If no message was received, signal the election timeout condition *)
+      (* print_endline "Election timeout reached without receiving a message"; *)
       Lwt_condition.signal election_timeout_condition ();
       Lwt.return ()  (* Return unit to complete the monadic flow *)
     )
     else (
       (* If a message was received, reset the flag and restart the loop *)
+      (* print_endline "Message received before election timeout"; *)
       messages_recieved := false;
       loop ()  (* Recursively call loop to restart the timeout *)
     )
@@ -293,37 +298,56 @@ let handle_append_entries buffer =
 (* Call AppendEntriesRPC *)
 let call_append_entries address port prev_log_index entries =
   (* Setup Http/2 connection for RequestVote RPC *)
-  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
-  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
-  >>= fun () ->
-  let error_handler _ = print_endline "error" in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
+  Lwt.catch(fun () ->
+    Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
+    >>= fun addresses ->
+    let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+    >>= fun () ->
+    let error_handler _ = print_endline "error" in
+    H2_lwt_unix.Client.create_connection ~error_handler socket
+    >>= fun connection ->
+    (* Ensure socket is closed *)
+    Lwt.finalize
+    (fun () ->
 
-  (* code generation for RequestVote RPC *)
-  let open Ocaml_protoc_plugin in
-  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.appendEntries in
-  let prev_log_term = if prev_log_index < List.length !log && prev_log_index >= 0 then (List.nth !log prev_log_index).term else 0 in
-  let req = Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
-  let enc = encode req |> Writer.contents in
-
-  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
-    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
-    ~handler:
-      (Client.Rpc.unary enc ~f:(fun decoder ->
-            let+ decoder = decoder in
-            match decoder with
-            | Some decoder -> (
-                Reader.create decoder |> decode |> function
-                | Ok v -> v
-                | Error e ->
-                    failwith
-                      (Printf.sprintf "Could not decode request: %s"
-                        (Result.show_error e)))
-            | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
-    ()
+      (* code generation for RequestVote RPC *)
+      let open Ocaml_protoc_plugin in
+      let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.appendEntries in
+      let prev_log_term = if prev_log_index < List.length !log && prev_log_index >= 0 then (List.nth !log prev_log_index).term else 0 in
+      let req = Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
+      let enc = encode req |> Writer.contents in
+  
+      Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
+        ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+        ~handler:
+          (Client.Rpc.unary enc ~f:(fun decoder ->
+                let+ decoder = decoder in
+                match decoder with
+                | Some decoder -> (
+                    Reader.create decoder |> decode |> function
+                    | Ok v -> v
+                    | Error e ->
+                        failwith
+                          (Printf.sprintf "Could not decode request: %s"
+                            (Result.show_error e)))
+                | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
+        ()
+    )
+    (fun () ->
+      Lwt_unix.close socket
+    )
+  ) (fun exn ->
+    (* Handle connection errors or other exceptions gracefully *)
+    let error_msg = Printexc.to_string exn in
+    if entries = [] then
+      Printf.printf "Heartbeat to server %d failed: %s\n" port error_msg
+    else
+      Printf.printf "AppendEntries RPC to server %d failed: %s\n" port error_msg;
+    flush stdout;
+    let code : Grpc.Status.code = Internal in
+    Lwt.return (Ok (Raftkv.KeyValueStore.AppendEntries.Response.make (), Grpc.Status.v code))
+  )
 
 let append_entry index value state =
   (* add entry to log *)
@@ -399,36 +423,56 @@ let handle_put_request buffer =
 
 (* Call RequestVoteRPC *)
 let call_request_vote address port candidate_id term last_log_index last_log_term =
-  
   (* Setup Http/2 connection for RequestVote RPC *)
-  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
-  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
-  >>= fun () ->
+  Lwt.catch
+    (fun () ->
+       Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
+       >>= fun addresses ->
+       let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+       Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+       >>= fun () ->
 
-  let error_handler _ = print_endline "RPC Error"; in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
+       let error_handler _ = print_endline "RPC Error" in
+       H2_lwt_unix.Client.create_connection ~error_handler socket
+       >>= fun connection ->
 
-  (* Create and send the RequestVote RPC *)
-  let open Ocaml_protoc_plugin in
-  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.requestVote in
-  let req = Raftkv.RequestVoteRequest.make ~candidate_id ~term ~last_log_index ~last_log_term () in
-  let enc = encode req |> Writer.contents in
+       (* Create and send the RequestVote RPC *)
+       let open Ocaml_protoc_plugin in
+       let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.requestVote in
+       let req =
+         Raftkv.RequestVoteRequest.make
+           ~candidate_id
+           ~term
+           ~last_log_index
+           ~last_log_term
+           ()
+       in
+       let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"RequestVote"
-    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
-    ~handler:
-      (Client.Rpc.unary enc ~f:(fun decoder ->
-            let+ decoder = decoder in
-            match decoder with
-            | Some decoder -> (
-                Reader.create decoder |> decode |> function
-                | Ok v -> v
-                | Error e -> failwith (Printf.sprintf "Could not decode request: %s" (Result.show_error e)))
-            | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
-    ()
+       Client.call
+         ~service:"raftkv.KeyValueStore"
+         ~rpc:"RequestVote"
+         ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+         ~handler:
+           (Client.Rpc.unary enc ~f:(fun decoder ->
+                let+ decoder = decoder in
+                match decoder with
+                | Some decoder -> (
+                    Reader.create decoder |> decode |> function
+                    | Ok v -> v
+                    | Error e ->
+                        failwith (Printf.sprintf "Could not decode request: %s" (Result.show_error e)))
+                | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
+         ()
+    )
+    (fun exn ->
+      (* Handle connection errors or other exceptions gracefully *)
+      let error_msg = Printexc.to_string exn in
+      Printf.printf "RequestVote RPC failed: %s\n" error_msg;
+      flush stdout;
+      let code : Grpc.Status.code = Internal in
+      Lwt.return (Ok (Raftkv.KeyValueStore.RequestVote.Response.make (), Grpc.Status.v code))
+    )
 
 
 let send_heartbeats () =

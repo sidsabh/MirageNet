@@ -18,7 +18,7 @@ let call_server address port =
   let open Ocaml_protoc_plugin in
   let open Raftkv in
   let encode, decode = Service.make_client_functions Raftkv.FrontEnd.startRaft in
-  let req = Raftkv.IntegerArg.make ~arg:3 () in 
+  let req = Raftkv.IntegerArg.make ~arg:4 () in 
   let enc = encode req |> Writer.contents in
 
   Client.call ~service:"raftkv.FrontEnd" ~rpc:"StartRaft"
