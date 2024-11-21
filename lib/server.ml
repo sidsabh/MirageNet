@@ -25,6 +25,7 @@ let votes_received : int list ref = ref []
 let commit_index = ref 0
 let last_applied = ref 0
 let log : Raftkv.LogEntry.t list ref = ref []
+let prev_log_index = ref 0
 let state = Hashtbl.create 10
 let messages_recieved = ref false
 let leader_id = ref 0
@@ -388,12 +389,12 @@ let batch_loop () =
     let batch_timeout = 0.05 in
     Lwt_unix.sleep batch_timeout >>= fun () ->
       (* Check for new entries based on commit_index *)
-      let check_entry_index (entry: Raftkv.LogEntry.t) =
-        entry.index > !commit_index
-      in
+      let verify_index (entry: Raftkv.LogEntry.t) =
+        entry.index > !commit_index in
       Mutex.lock log_mutex;
-      let new_entries = List.filter check_entry_index !log in
+      let new_entries = List.filter verify_index !log in
       let new_commit_index = List.length !log - 1 in
+      let next_prev_log_index = new_commit_index in
       Mutex.unlock log_mutex;
 
       if !role = "leader" && List.length new_entries > 0 then (
@@ -411,8 +412,8 @@ let batch_loop () =
           if server_id <> !id then 
             Lwt.async (fun () ->
               let port = 9000 + server_id in
-              let prev_log_index = List.length !log - List.length new_entries - 1 in
-              call_append_entries address port prev_log_index new_entries >>= fun res ->
+              let prev_log_index_capture = !prev_log_index in
+              call_append_entries address port prev_log_index_capture new_entries >>= fun res ->
               match res with
               | Ok (v, _) -> 
                 let _res_term = v.term in
@@ -428,6 +429,7 @@ let batch_loop () =
                     the servers (e.g., entry 7 in Figure 6). This also commits
                     all preceding entries in the leader’s log, including entries
                     created by previous leaders. *)
+                    
                     if (new_commit_index > !commit_index) then
                       commit_index := new_commit_index;
                     Lwt_condition.signal state.majority_condition ();
@@ -438,7 +440,7 @@ let batch_loop () =
                 Lwt.return ()
             )
         ) all_server_ids;
-
+        prev_log_index := next_prev_log_index;
         Lwt_condition.wait state.majority_condition >>= fun () ->
         apply_commited_entries ();
         (* Majority condition reached, signal requests that they are ok to respond to client *)
@@ -450,11 +452,12 @@ let batch_loop () =
   loop ()
   
 
-let append_entry index key value =
+let append_entry key value =
   (* add entry to log *)
   let command = key ^ " " ^ value in
-  let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command:command ~index () in
   Mutex.lock log_mutex;
+  let index = List.length !log in
+  let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command:command ~index () in
   log := List.concat [!log; [new_log_entry]];
   Mutex.unlock log_mutex;
 
@@ -486,8 +489,7 @@ let handle_put_request buffer =
       Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"clientId\": %d\n\t\"requestId\": %d\n}\n"
         req_key req_value req_client_id req_request_id;
       flush stdout;
-      let index = List.length !log in
-      let* _ = append_entry index req_key req_value in
+      let* _ = append_entry req_key req_value in
       let reply = KeyValueStore.Put.Response.make ~wrongLeader:false ~error:"" () in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
     
@@ -555,8 +557,9 @@ let send_heartbeats () =
       Lwt.async (fun () ->
         let address = "localhost" in
         let port = 9000 + server_id in
-        let prev_log_index = List.length !log - 1 in
-        call_append_entries address port prev_log_index [] >>= fun res ->
+        (* Printf.printf "Leader: Sending heartbeat with prev_log_index: %d\n" prev_log_index;
+        flush stdout; *)
+        call_append_entries address port !prev_log_index [] >>= fun res ->
         match res with
         | Ok (res, _) -> 
             if not res.success then
@@ -722,6 +725,7 @@ Lwt.async (fun () ->
   role := "follower";
   commit_index := -1;
   last_applied := -1;
+  prev_log_index := -1;
 
   (* Start election timeout *)
   Lwt.async election_loop;
