@@ -23,7 +23,9 @@ let term = ref 0
 let voted_for = ref 0
 let votes_received : int list ref = ref []
 let commit_index = ref 0
+let last_applied = ref 0
 let log : Raftkv.LogEntry.t list ref = ref []
+let state = Hashtbl.create 10
 let messages_recieved = ref false
 let leader_id = ref 0
 
@@ -57,7 +59,12 @@ let handle_get_request buffer =
   match request with
   | Ok v ->
       Printf.printf "Received Get request for key: %s\n" v.key;
-      let value = "dummy_value_for_key" in
+      flush stdout;
+      let value = try
+        Hashtbl.find state v.key
+      with
+      | Not_found -> failwith "Key not found"
+      in
       let reply = KeyValueStore.Get.Response.make ~wrongLeader:false ~error:"" ~value () in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e -> failwith (Printf.sprintf "Error decoding Get request: %s" (Result.show_error e))
@@ -152,7 +159,20 @@ let start_election_timeout () =
   in
   loop ()  (* Start the loop initially *)
 
-
+let apply_commited_entries () =
+  let rec loop i = 
+    if (i <= !commit_index) then (
+      let entry = List.nth !log i in
+      Printf.printf "Applying log entry %d: %s\n" i entry.command;
+      flush stdout;
+      let key, value = Scanf.sscanf entry.command "%s %s" (fun k v -> k, v) in
+      Hashtbl.replace state key value;
+      last_applied := i;
+      loop (i + 1)
+    )
+  in
+  loop (!last_applied + 1)
+  
 
 
 (* Handle AppendEntriesRPC *)
@@ -176,6 +196,10 @@ let handle_append_entries buffer =
     let return = ref false in
     let success = ref true in
 
+    if req_leader_commit > !commit_index then
+      Printf.printf "Received leader_commit_index: %d, current commit_index: %d\n" req_leader_commit !commit_index;
+      flush stdout;
+
     if req_entries = [] then (
       (* Heartbeat *)
       if req_term > !term || (req_term = !term && req_leader_id <> !leader_id) then (
@@ -194,12 +218,7 @@ let handle_append_entries buffer =
       ) else if req_term = !term && req_leader_id = !leader_id then 
         (* Heartbeat from current leader *)
         messages_recieved := true;
-      
-      return := true;
-      success := true;
-    );
-
-    if not !return then (
+    ) else (
       Printf.printf "Received AppendEntries request:\n{\n\
                     \t\"term\": %d\n\
                     \t\"leader_id\": %d\n\
@@ -216,12 +235,18 @@ let handle_append_entries buffer =
 
     (* Condition 1: Reply false if term < currentTerm *)
     if req_term < !term then (
+      if req_entries = [] then
+        Printf.printf "Failing heartbeat, req_term: %d, term: %d\n" req_term !term;
+        flush stdout;
       ignore(success := false);
       ignore(return := true);
     );
     
     (* Condition 2: Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm *)
     if not !return && req_prev_log_index <> -1 && (List.length !log <= req_prev_log_index || (List.nth !log req_prev_log_index).term <> req_prev_log_term) then (
+      if req_entries = [] then
+        Printf.printf "Failing heartbeat, prev_log_index: %d\n" req_prev_log_index;
+        flush stdout;
       ignore(success := false);
       ignore(return := true);
     );
@@ -285,6 +310,7 @@ let handle_append_entries buffer =
         let new_log_length = List.length !log in
         let new_commit_index = min req_leader_commit (new_log_length - 1) in
         commit_index := new_commit_index;
+        apply_commited_entries ()
       );
     );
 
@@ -354,6 +380,9 @@ let call_append_entries address port prev_log_index entries =
     Lwt.return (Ok (Raftkv.KeyValueStore.AppendEntries.Response.make (), Grpc.Status.v code))
   )
 
+
+
+
 let batch_loop () =
   let rec loop () =
     let batch_timeout = 0.05 in
@@ -386,13 +415,14 @@ let batch_loop () =
               call_append_entries address port prev_log_index new_entries >>= fun res ->
               match res with
               | Ok (v, _) -> 
-                let res_term = v.term in
+                let _res_term = v.term in
                 let res_success = v.success in
-                Printf.printf "AppendEntries RPC to server %d successful, term: %d, success: %b\n" server_id res_term res_success;
-                flush stdout;
                 if res_success then (
                   state.successful_replies <- state.successful_replies + 1;
-                  if state.successful_replies >= (!num_servers / 2) then
+                  Printf.printf "AppendEntries RPC to server %d successful, replies: %d\n" server_id state.successful_replies;
+                  flush stdout;
+                  if state.successful_replies >= (!num_servers / 2) then (
+                    
                     (* A log entry is committed once the leader
                     that created the entry has replicated it on a majority of
                     the servers (e.g., entry 7 in Figure 6). This also commits
@@ -401,6 +431,7 @@ let batch_loop () =
                     if (new_commit_index > !commit_index) then
                       commit_index := new_commit_index;
                     Lwt_condition.signal state.majority_condition ();
+                  );
                 );
                 Lwt.return ()
               | Error _ -> 
@@ -409,6 +440,7 @@ let batch_loop () =
         ) all_server_ids;
 
         Lwt_condition.wait state.majority_condition >>= fun () ->
+        apply_commited_entries ();
         (* Majority condition reached, signal requests that they are ok to respond to client *)
         Lwt_condition.broadcast batch_condition ();
         loop ()
@@ -418,9 +450,10 @@ let batch_loop () =
   loop ()
   
 
-let append_entry index value =
+let append_entry index key value =
   (* add entry to log *)
-  let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command:value ~index () in
+  let command = key ^ " " ^ value in
+  let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command:command ~index () in
   Mutex.lock log_mutex;
   log := List.concat [!log; [new_log_entry]];
   Mutex.unlock log_mutex;
@@ -454,7 +487,7 @@ let handle_put_request buffer =
         req_key req_value req_client_id req_request_id;
       flush stdout;
       let index = List.length !log in
-      let* _ = append_entry index req_value in
+      let* _ = append_entry index req_key req_value in
       let reply = KeyValueStore.Put.Response.make ~wrongLeader:false ~error:"" () in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
     
@@ -525,8 +558,10 @@ let send_heartbeats () =
         let prev_log_index = List.length !log - 1 in
         call_append_entries address port prev_log_index [] >>= fun res ->
         match res with
-        | Ok _ -> 
-            (* Printf.printf "Heartbeat to server %d successful\n" server_id; *)
+        | Ok (res, _) -> 
+            if not res.success then
+              Printf.printf "Heartbeat to server %d returned false\n" server_id;
+
             Lwt.return()
         | Error _ -> 
             (* Printf.printf "Heartbeat to server %d failed\n" server_id; *)
@@ -535,11 +570,12 @@ let send_heartbeats () =
   ) all_server_ids;
   Lwt.return()
 
-  let rec heartbeat_loop () =
-    Lwt_unix.sleep 0.3 >>= fun () ->  (* Sleep for 100ms *)
-    send_heartbeats () >>= fun () ->  (* Send heartbeat to all servers *)
-    heartbeat_loop ()  
-    (* Lwt.return() *)
+let rec heartbeat_loop () =
+  let heartbeat_timeout = 0.1 in
+  Lwt_unix.sleep heartbeat_timeout >>= fun () ->  (* Sleep for 100ms *)
+  send_heartbeats () >>= fun () ->  (* Send heartbeat to all servers *)
+  heartbeat_loop ()  
+  (* Lwt.return() *)
   
 
 
@@ -685,6 +721,7 @@ Lwt.async (fun () ->
   (* Initialize as follower *)
   role := "follower";
   commit_index := -1;
+  last_applied := -1;
 
   (* Start election timeout *)
   Lwt.async election_loop;
