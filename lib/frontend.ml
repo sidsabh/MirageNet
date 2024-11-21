@@ -8,6 +8,9 @@ open Raftkv
 let num_servers = ref 0
 let leader_id = ref 1
 
+let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
+
+
 (* Decode the incoming GetKey request *)
 let handle_get_request buffer =
   let open Ocaml_protoc_plugin in
@@ -74,7 +77,7 @@ let send_put_request_to_leader address key value clientId requestId =
       let _error = res.error in
       let value = res.value in
       if wrong_leader then (
-        leader_id := !leader_id + 1;
+        leader_id := int_of_string value;
         Printf.printf "Leader is wrong, trying raftserver%d\n" !leader_id;
         flush stdout;
         loop ()
@@ -136,8 +139,8 @@ let handle_replace_request buffer =
 let spawn_server i =
   let name = "raftserver" ^ string_of_int i in
   let command = Printf.sprintf 
-    "./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; fflush()}' >> raft.log &"
-    i !num_servers name i in
+    "strace -o strace_raftserver%d ./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; fflush()}' >> raft.log &"
+    i i !num_servers name i in
   ignore (Sys.command command)
 
 

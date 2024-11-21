@@ -27,6 +27,9 @@ let log : Raftkv.LogEntry.t list ref = ref []
 let messages_recieved = ref false
 let leader_id = ref 0
 
+let log_mutex = Mutex.create ()  (* Mutex to protect the log *)
+
+
 
 
 
@@ -270,7 +273,8 @@ let handle_append_entries buffer =
       if new_log_length < (req_prev_log_index + List.length req_entries + 1) then (
         let new_entries = drop (new_log_length - (req_prev_log_index + 1)) req_entries in
         log := List.concat [!log; new_entries];
-        Printf.printf "New log after appending entries: %s\n" (String.concat ", " (List.map log_entry_to_string !log));
+        (* Printf.printf "New log after appending entries: %s\n" (String.concat ", " (List.map log_entry_to_string !log)); *)
+        Printf.printf "New log length: %d\n" (List.length !log);
         flush stdout;
       );
     );
@@ -294,6 +298,7 @@ let handle_append_entries buffer =
   | Error e -> 
       failwith (Printf.sprintf "Error decoding AppendEntries request: %s" (Result.show_error e))
 
+let batch_condition = Lwt_condition.create ()
 
 (* Call AppendEntriesRPC *)
 let call_append_entries address port prev_log_index entries =
@@ -349,43 +354,79 @@ let call_append_entries address port prev_log_index entries =
     Lwt.return (Ok (Raftkv.KeyValueStore.AppendEntries.Response.make (), Grpc.Status.v code))
   )
 
-let append_entry index value state =
+let batch_loop () =
+  let rec loop () =
+    let batch_timeout = 0.05 in
+    Lwt_unix.sleep batch_timeout >>= fun () ->
+      (* Check for new entries based on commit_index *)
+      let check_entry_index (entry: Raftkv.LogEntry.t) =
+        entry.index > !commit_index
+      in
+      Mutex.lock log_mutex;
+      let new_entries = List.filter check_entry_index !log in
+      let new_commit_index = List.length !log - 1 in
+      Mutex.unlock log_mutex;
+
+      if !role = "leader" && List.length new_entries > 0 then (
+        Printf.printf "Batch loop detected %d new entries\n" (List.length new_entries);
+        flush stdout;
+
+        (* Condition to wait for majority to commit *)
+        let state = create_append_entry_state () in
+
+
+        (* send out append entries *)
+        let address = "localhost" in
+        let all_server_ids = List.init !num_servers (fun i -> i + 1) in
+        List.iter (fun server_id ->
+          if server_id <> !id then 
+            Lwt.async (fun () ->
+              let port = 9000 + server_id in
+              let prev_log_index = List.length !log - List.length new_entries - 1 in
+              call_append_entries address port prev_log_index new_entries >>= fun res ->
+              match res with
+              | Ok (v, _) -> 
+                let res_term = v.term in
+                let res_success = v.success in
+                Printf.printf "AppendEntries RPC to server %d successful, term: %d, success: %b\n" server_id res_term res_success;
+                flush stdout;
+                if res_success then (
+                  state.successful_replies <- state.successful_replies + 1;
+                  if state.successful_replies >= (!num_servers / 2) then
+                    (* A log entry is committed once the leader
+                    that created the entry has replicated it on a majority of
+                    the servers (e.g., entry 7 in Figure 6). This also commits
+                    all preceding entries in the leader’s log, including entries
+                    created by previous leaders. *)
+                    if (new_commit_index > !commit_index) then
+                      commit_index := new_commit_index;
+                    Lwt_condition.signal state.majority_condition ();
+                );
+                Lwt.return ()
+              | Error _ -> 
+                Lwt.return ()
+            )
+        ) all_server_ids;
+
+        Lwt_condition.wait state.majority_condition >>= fun () ->
+        (* Majority condition reached, signal requests that they are ok to respond to client *)
+        Lwt_condition.broadcast batch_condition ();
+        loop ()
+      ) else
+        loop ()
+  in
+  loop ()
+  
+
+let append_entry index value =
   (* add entry to log *)
   let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command:value ~index () in
+  Mutex.lock log_mutex;
   log := List.concat [!log; [new_log_entry]];
+  Mutex.unlock log_mutex;
 
-  (* send out append entries *)
-  let address = "localhost" in
-  let all_server_ids = List.init !num_servers (fun i -> i + 1) in
-  List.iter (fun server_id ->
-    if server_id <> !id then (* Don't request a vote from yourself *)
-      Lwt.async (fun () ->
-        let port = 9000 + server_id in
-        let prev_log_index = List.length !log - 2 in
-        call_append_entries address port prev_log_index [new_log_entry] >>= fun res ->
-        match res with
-        | Ok (v, _) -> 
-          let res_term = v.term in
-          let res_success = v.success in
-          Printf.printf "AppendEntries RPC to server %d successful, term: %d, success: %b\n" server_id res_term res_success;
-          flush stdout;
-          if res_success then (
-            state.successful_replies <- state.successful_replies + 1;
-            if state.successful_replies >= (!num_servers / 2) then
-              (* A log entry is committed once the leader
-              that created the entry has replicated it on a majority of
-              the servers (e.g., entry 7 in Figure 6). This also commits
-              all preceding entries in the leader’s log, including entries
-              created by previous leaders. *)
-              if (!commit_index < index) then
-                commit_index := index;
-              Lwt_condition.signal state.majority_condition ();
-          );
-          Lwt.return ()
-        | Error _ -> 
-          Lwt.return ()
-      )
-  ) all_server_ids;
+  (* wait for batch condition *)
+  let* () = Lwt_condition.wait batch_condition in
 
   Lwt.return ()
 
@@ -402,21 +443,20 @@ let handle_put_request buffer =
     let req_value = v.value in
     let req_client_id = v.clientId in
     let req_request_id = v.requestId in
-    Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"clientId\": %d\n\t\"requestId\": %d\n}\n"
-      req_key req_value req_client_id req_request_id;
-    flush stdout;
-
-
+    
+    
     if !role <> "leader" then
-      let reply = KeyValueStore.Put.Response.make ~wrongLeader:true ~error:"" () in
+      let correct_leader = string_of_int !leader_id in
+      let reply = KeyValueStore.Put.Response.make ~wrongLeader:true ~error:"" ~value:correct_leader () in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-    else
+    else (
+      Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"clientId\": %d\n\t\"requestId\": %d\n}\n"
+        req_key req_value req_client_id req_request_id;
+      flush stdout;
       let index = List.length !log in
-      let state = create_append_entry_state () in
-      let* _ = append_entry index req_value state in
-      let* () = Lwt_condition.wait state.majority_condition in
+      let* _ = append_entry index req_value in
       let reply = KeyValueStore.Put.Response.make ~wrongLeader:false ~error:"" () in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
     
   | Error e -> failwith (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
@@ -614,11 +654,12 @@ let () =
   Random.init ((Unix.time () |> int_of_float) + !id);
 
   let port = 9000 + !id in
-  let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
-  let server_name = Printf.sprintf "raftserver%d" !id in
+let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+let server_name = Printf.sprintf "raftserver%d" !id in
 
-  (* Start the server *)
-  Lwt.async (fun () ->
+(* Start the server *)
+Lwt.async (fun () -> 
+  try
     let server =
       H2_lwt_unix.Server.create_connection_handler ?config:None
         ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
@@ -628,7 +669,18 @@ let () =
       Lwt_io.establish_server_with_client_socket listen_address server
     in
     Printf.printf "Server %s listening on port %i for grpc requests\n" server_name port;
-    flush stdout);
+    flush stdout; (* Return unit Lwt.t *)
+  with
+  | Unix.Unix_error (err, func, arg) ->
+      (* Handle Unix system errors *)
+      Printf.eprintf "Unix error: %s in function %s with argument %s\n"
+        (Unix.error_message err) func arg;
+      Lwt.return ()  (* Return unit Lwt.t for error cases *)
+  | exn ->
+      (* Handle other exceptions *)
+      Printf.eprintf "Error: %s\n" (Printexc.to_string exn);
+      Lwt.return ()); (* Return unit Lwt.t for error cases *)
+
 
   (* Initialize as follower *)
   role := "follower";
@@ -636,6 +688,9 @@ let () =
 
   (* Start election timeout *)
   Lwt.async election_loop;
+
+  (* Start batch loop *)
+  Lwt.async batch_loop;
 
   (* Keep the server running *)
   let forever, _ = Lwt.wait () in
