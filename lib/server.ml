@@ -248,7 +248,7 @@ let handle_append_entries buffer =
     (* Condition 2: Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm *)
     if not !return && req_prev_log_index <> -1 && (List.length !log <= req_prev_log_index || (List.nth !log req_prev_log_index).term <> req_prev_log_term) then (
       if req_entries = [] then
-        Printf.printf "Failing heartbeat, prev_log_index: %d\n" req_prev_log_index;
+        Printf.printf "Failing heartbeat, prev_log_index: %d, log length: %d\n" req_prev_log_index (List.length !log);
         flush stdout;
       ignore(success := false);
       ignore(return := true);
@@ -592,8 +592,42 @@ let rec heartbeat_loop () =
   heartbeat_loop ()  
   (* Lwt.return() *)
   
+(* Call AppendEntriesRPC *)
+
+let call_new_leader () =
+  (* Setup Http/2 connection *)
+  Lwt_unix.getaddrinfo "localhost" (string_of_int 8001) [ Unix.(AI_FAMILY PF_INET) ]
+  >>= fun addresses ->
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+  >>= fun () ->
+  let error_handler _ = print_endline "error" in
+  H2_lwt_unix.Client.create_connection ~error_handler socket
+  >>= fun connection ->
+(* Continue with the rest of your code using `connection` *)
 
 
+  (* code generation *)
+  let open Ocaml_protoc_plugin in
+  let encode, decode = Service.make_client_functions Raftkv.FrontEnd.newLeader in
+  let req = Raftkv.IntegerArg.make ~arg:!id () in 
+  let enc = encode req |> Writer.contents in
+
+  Client.call ~service:"raftkv.FrontEnd" ~rpc:"NewLeader"
+    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+    ~handler:
+      (Client.Rpc.unary enc ~f:(fun decoder ->
+           let+ decoder = decoder in
+           match decoder with
+           | Some decoder -> (
+               Reader.create decoder |> decode |> function
+               | Ok v -> v
+               | Error e ->
+                   failwith
+                     (Printf.sprintf "Could not decode request: %s"
+                        (Result.show_error e)))
+           | None -> Raftkv.FrontEnd.NewLeader.Response.make ()))
+    ()
 
 (* This function handles the request vote and counting the votes *)
 let count_votes () =
@@ -604,6 +638,9 @@ let count_votes () =
     (* If we've received a majority, we win the election *)
     Printf.printf "We have a majority of votes (%d/%d).\n" (List.length !votes_received) total_servers;
     role := "leader";
+    leader_id := !id;
+    prev_log_index := List.length !log - 1;
+    ignore(call_new_leader ());
     Lwt.async (fun () -> heartbeat_loop ())
   )
   else

@@ -90,4 +90,7 @@ service FrontEnd {
     rpc Put(KeyValue) returns (Reply) {};
     rpc Replace(KeyValue) returns (Reply) {};
     rpc StartRaft(IntegerArg) returns (Reply) {};
+
+    // Internal Use
+    rpc NewLeader(IntegerArg) returns (Empty) {};
 }
