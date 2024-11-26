@@ -31,6 +31,8 @@ let messages_recieved = ref false
 let leader_id = ref 0
 
 let log_mutex = Mutex.create ()  (* Mutex to protect the log *)
+(* Global map to store active connections to each server *)
+let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t = Hashtbl.create 10
 
 
 
@@ -327,59 +329,91 @@ let handle_append_entries buffer =
 
 let batch_condition = Lwt_condition.create ()
 
-(* Call AppendEntriesRPC *)
-let call_append_entries address port prev_log_index entries =
-  (* Setup Http/2 connection for RequestVote RPC *)
-  Lwt.catch(fun () ->
-    Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-    >>= fun addresses ->
-    let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-    Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
-    >>= fun () ->
-    let error_handler _ = print_endline "error" in
-    H2_lwt_unix.Client.create_connection ~error_handler socket
-    >>= fun connection ->
-    (* Ensure socket is closed *)
-    Lwt.finalize
+let rec _bind_with_retry socket src_port retry_interval =
+  let src_address = Unix.ADDR_INET (Unix.inet_addr_loopback, src_port) in
+  Lwt.catch
     (fun () ->
+      (* Attempt to bind the socket *)
+      Lwt_unix.bind socket src_address >>= fun () ->
+      Lwt.return_unit) (* Return success if bind succeeds *)
+    (function
+    | Unix.Unix_error (Unix.EADDRINUSE, _, _) ->
+        (* Port is in use: log and retry *)
+        Printf.eprintf "Port %d is in use, retrying in %.1f seconds...\n"
+          src_port retry_interval;
+        flush stderr;
+        Lwt_unix.sleep retry_interval >>= fun () ->
+        _bind_with_retry socket src_port retry_interval
+    | Unix.Unix_error (Unix.EADDRNOTAVAIL, _, _) ->
+        (* Address not available: log and retry *)
+        Printf.eprintf "Port %d not available, retrying in %.1f seconds...\n"
+          src_port retry_interval;
+        flush stderr;
+        Lwt_unix.sleep retry_interval >>= fun () ->
+        _bind_with_retry socket src_port retry_interval
+    | exn ->
+        (* Unexpected error: re-raise *)
+        Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string exn);
+        flush stderr;
+        Lwt.fail exn)
 
-      (* code generation for RequestVote RPC *)
-      let open Ocaml_protoc_plugin in
-      let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.appendEntries in
-      let prev_log_term = if prev_log_index < List.length !log && prev_log_index >= 0 then (List.nth !log prev_log_index).term else 0 in
-      let req = Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
-      let enc = encode req |> Writer.contents in
-  
-      Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
-        ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
-        ~handler:
-          (Client.Rpc.unary enc ~f:(fun decoder ->
-                let+ decoder = decoder in
-                match decoder with
-                | Some decoder -> (
-                    Reader.create decoder |> decode |> function
-                    | Ok v -> v
-                    | Error e ->
-                        failwith
-                          (Printf.sprintf "Could not decode request: %s"
-                            (Result.show_error e)))
-                | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
-        ()
-    )
+(* Retry mechanism for Lwt_unix.connect *)
+let rec _connect_with_retry socket addr retry_interval =
+  Lwt.catch
     (fun () ->
-      Lwt_unix.close socket
-    )
-  ) (fun exn ->
-    (* Handle connection errors or other exceptions gracefully *)
-    let error_msg = Printexc.to_string exn in
-    if entries = [] then
-      Printf.printf "Heartbeat to server %d failed: %s\n" port error_msg
-    else
-      Printf.printf "AppendEntries RPC to server %d failed: %s\n" port error_msg;
-    flush stdout;
-    let code : Grpc.Status.code = Internal in
-    Lwt.return (Ok (Raftkv.KeyValueStore.AppendEntries.Response.make (), Grpc.Status.v code))
-  )
+      Lwt_unix.connect socket addr >>= fun () ->
+      Lwt.return_unit)
+    (function
+    | Unix.Unix_error (Unix.EADDRNOTAVAIL, _, _) ->
+        (* Log and retry *)
+        (* Printf.eprintf "EADDRNOTAVAIL: Retrying in %.1f seconds...\n" retry_interval;
+        flush stderr; *)
+        Lwt_unix.sleep retry_interval >>= fun () ->
+        _connect_with_retry socket addr retry_interval
+    | Unix.Unix_error (Unix.EADDRINUSE, _, _) ->
+        (* Log and retry *)
+        (* Printf.eprintf "EADDRINUSE: Retrying in %.1f seconds...\n" retry_interval;
+        flush stderr; *)
+        Lwt_unix.sleep retry_interval >>= fun () ->
+        _connect_with_retry socket addr retry_interval
+    | exn ->
+        (* Unexpected errors *)
+        Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string exn);
+        flush stderr;
+        Lwt.fail exn)
+
+
+
+
+(* Call AppendEntriesRPC *)
+let call_append_entries port prev_log_index entries =
+  (* Setup Http/2 connection for RequestVote RPC *)
+  let connection = Hashtbl.find server_connections port in
+
+  (* code generation for RequestVote RPC *)
+  let open Ocaml_protoc_plugin in
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.appendEntries in
+  let prev_log_term = if prev_log_index < List.length !log && prev_log_index >= 0 then (List.nth !log prev_log_index).term else 0 in
+  let req = Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index ~prev_log_term:prev_log_term ~entries ~leader_commit:!commit_index () in 
+  let enc = encode req |> Writer.contents in
+
+  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
+    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+    ~handler:
+      (Client.Rpc.unary enc ~f:(fun decoder ->
+            let+ decoder = decoder in
+            match decoder with
+            | Some decoder -> (
+                Reader.create decoder |> decode |> function
+                | Ok v -> v
+                | Error e ->
+                    failwith
+                      (Printf.sprintf "Could not decode request: %s"
+                        (Result.show_error e)))
+            | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
+    ()
+
+
 
 
 
@@ -406,14 +440,13 @@ let batch_loop () =
 
 
         (* send out append entries *)
-        let address = "localhost" in
         let all_server_ids = List.init !num_servers (fun i -> i + 1) in
         List.iter (fun server_id ->
           if server_id <> !id then 
             Lwt.async (fun () ->
               let port = 9000 + server_id in
               let prev_log_index_capture = !prev_log_index in
-              call_append_entries address port prev_log_index_capture new_entries >>= fun res ->
+              call_append_entries port prev_log_index_capture new_entries >>= fun res ->
               match res with
               | Ok (v, _) -> 
                 let _res_term = v.term in
@@ -497,73 +530,52 @@ let handle_put_request buffer =
 
 
 (* Call RequestVoteRPC *)
-let call_request_vote address port candidate_id term last_log_index last_log_term =
+let call_request_vote port candidate_id term last_log_index last_log_term =
   (* Setup Http/2 connection for RequestVote RPC *)
-  Lwt.catch
-    (fun () ->
-       Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-       >>= fun addresses ->
-       let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-       Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
-       >>= fun () ->
+  let connection = Hashtbl.find server_connections port in
 
-       let error_handler _ = print_endline "RPC Error" in
-       H2_lwt_unix.Client.create_connection ~error_handler socket
-       >>= fun connection ->
+  (* Create and send the RequestVote RPC *)
+  let open Ocaml_protoc_plugin in
+  let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.requestVote in
+  let req =
+    Raftkv.RequestVoteRequest.make
+      ~candidate_id
+      ~term
+      ~last_log_index
+      ~last_log_term
+      ()
+  in
+  let enc = encode req |> Writer.contents in
 
-       (* Create and send the RequestVote RPC *)
-       let open Ocaml_protoc_plugin in
-       let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.requestVote in
-       let req =
-         Raftkv.RequestVoteRequest.make
-           ~candidate_id
-           ~term
-           ~last_log_index
-           ~last_log_term
-           ()
-       in
-       let enc = encode req |> Writer.contents in
-
-       Client.call
-         ~service:"raftkv.KeyValueStore"
-         ~rpc:"RequestVote"
-         ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
-         ~handler:
-           (Client.Rpc.unary enc ~f:(fun decoder ->
-                let+ decoder = decoder in
-                match decoder with
-                | Some decoder -> (
-                    Reader.create decoder |> decode |> function
-                    | Ok v -> v
-                    | Error e ->
-                        failwith (Printf.sprintf "Could not decode request: %s" (Result.show_error e)))
-                | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
-         ()
-    )
-    (fun exn ->
-      (* Handle connection errors or other exceptions gracefully *)
-      let error_msg = Printexc.to_string exn in
-      Printf.printf "RequestVote RPC failed: %s\n" error_msg;
-      flush stdout;
-      let code : Grpc.Status.code = Internal in
-      Lwt.return (Ok (Raftkv.KeyValueStore.RequestVote.Response.make (), Grpc.Status.v code))
-    )
-
-
+  Client.call
+    ~service:"raftkv.KeyValueStore"
+    ~rpc:"RequestVote"
+    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+    ~handler:
+      (Client.Rpc.unary enc ~f:(fun decoder ->
+          let+ decoder = decoder in
+          match decoder with
+          | Some decoder -> (
+              Reader.create decoder |> decode |> function
+              | Ok v -> v
+              | Error e ->
+                  failwith (Printf.sprintf "Could not decode request: %s" (Result.show_error e)))
+          | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
+    ()
+    
 let send_heartbeats () =
   let all_server_ids = List.init !num_servers (fun i -> i + 1) in
   List.iter (fun server_id ->
     if server_id <> !id then (* Don't request a vote from yourself *)
       Lwt.async (fun () ->
-        let address = "localhost" in
         let port = 9000 + server_id in
-        (* Printf.printf "Leader: Sending heartbeat with prev_log_index: %d\n" prev_log_index;
+        (* Printf.printf "Leader: Sending heartbeat with prev_log_index: %d\n" !prev_log_index;
         flush stdout; *)
-        call_append_entries address port !prev_log_index [] >>= fun res ->
+        call_append_entries port !prev_log_index [] >>= fun res ->
         match res with
-        | Ok (res, _) -> 
-            if not res.success then
-              Printf.printf "Heartbeat to server %d returned false\n" server_id;
+        | Ok (_, _) -> 
+            (* if not res.success then
+              Printf.printf "Heartbeat to server %d returned false\n" server_id; *)
 
             Lwt.return()
         | Error _ -> 
@@ -604,14 +616,13 @@ let send_request_vote_rpcs () =
   List.iter (fun server_id ->
     if server_id <> !id then (* Don't request a vote from yourself *)
       Lwt.async (fun () ->
-        let address = "localhost" in
         let port = 9000 + server_id in
         let candidate_id = !id in
         let term = !term in
         let log_length = List.length !log in
         let last_log_index = if log_length = 0 then 0 else log_length - 1 in
         let last_log_term = if log_length = 0 then 0 else (List.nth !log last_log_index).term in
-        call_request_vote address port candidate_id term last_log_index last_log_term >>= fun res ->
+        call_request_vote port candidate_id term last_log_index last_log_term >>= fun res ->
         match res with
         | Ok (res, _) -> 
             (* Printf.printf "RequestVote RPC to server %d successful\n" server_id; *)
@@ -683,10 +694,60 @@ let server =
     v ()
     |> add_service ~name:"raftkv.KeyValueStore" ~service:key_value_store_service)
 
+(* Function to create a connection to another server *)
+let create_connection address port =
+  (* Retrieve the address information for the server *)
+  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
+  >>= fun addresses ->
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.setsockopt socket Unix.SO_REUSEPORT true;
+
+  (* Set up a bind if necessary, as per your previous code *)
+  let src_port = 7001 + !num_servers * (!id - 1) + (port - 9001) in
+  let bind_address = Unix.ADDR_INET (Unix.inet_addr_loopback, src_port) in
+  Lwt_unix.bind socket bind_address
+  >>= fun () ->
+  
+  (* Connect to the server *)
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
+  >>= fun () ->
+
+  (* Create the connection *)
+  let error_handler _ = print_endline "error" in
+  H2_lwt_unix.Client.create_connection ~error_handler socket
+  >>= fun connection ->
+
+  (* Store the connection in the global map *)
+  Hashtbl.add server_connections port connection;
+
+  Lwt.return ()
+  
+(* Function to establish connections to all other servers *)
+let establish_connections () =
+  (* Wait for 500 ms to give time for the other servers to spawn *)
+  Lwt_unix.sleep 0.5 >>= fun () ->
+
+  (* Loop through all server ports and establish connections to each one *)
+  let rec establish_for_ports ports = 
+    match ports with
+    | [] -> Lwt.return ()
+    | port :: rest -> 
+      create_connection "localhost" port >>= fun () ->
+      establish_for_ports rest
+  in
+
+  (* Generate the list of ports for other servers *)
+  let ports_to_connect = List.init !num_servers (fun i -> 9001 + i) |> List.filter (fun p -> p <> (!id + 9000)) in
+
+  (* Establish connections to the other servers *)
+  establish_for_ports ports_to_connect
+
 
 let () =
   id := int_of_string Sys.argv.(1);
   num_servers := int_of_string Sys.argv.(2);
+  
+  
 
   (* Seed the random number generator *)
   Random.self_init ();
@@ -722,6 +783,7 @@ Lwt.async (fun () ->
 
 
   (* Initialize as follower *)
+  Lwt.async establish_connections;
   role := "follower";
   commit_index := -1;
   last_applied := -1;
