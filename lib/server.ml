@@ -29,8 +29,12 @@ let prev_log_index = ref 0
 let state = Hashtbl.create 10
 let messages_recieved = ref false
 let leader_id = ref 0
+let next_index = ref []
+let last_batch = ref 0
+let match_index = ref []
 
 let log_mutex = Mutex.create ()  (* Mutex to protect the log *)
+let next_index_mutex = Mutex.create ()  (* Mutex to protect the next_index *)
 (* Global map to store active connections to each server *)
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t = Hashtbl.create 10
 
@@ -329,61 +333,6 @@ let handle_append_entries buffer =
 
 let batch_condition = Lwt_condition.create ()
 
-let rec _bind_with_retry socket src_port retry_interval =
-  let src_address = Unix.ADDR_INET (Unix.inet_addr_loopback, src_port) in
-  Lwt.catch
-    (fun () ->
-      (* Attempt to bind the socket *)
-      Lwt_unix.bind socket src_address >>= fun () ->
-      Lwt.return_unit) (* Return success if bind succeeds *)
-    (function
-    | Unix.Unix_error (Unix.EADDRINUSE, _, _) ->
-        (* Port is in use: log and retry *)
-        Printf.eprintf "Port %d is in use, retrying in %.1f seconds...\n"
-          src_port retry_interval;
-        flush stderr;
-        Lwt_unix.sleep retry_interval >>= fun () ->
-        _bind_with_retry socket src_port retry_interval
-    | Unix.Unix_error (Unix.EADDRNOTAVAIL, _, _) ->
-        (* Address not available: log and retry *)
-        Printf.eprintf "Port %d not available, retrying in %.1f seconds...\n"
-          src_port retry_interval;
-        flush stderr;
-        Lwt_unix.sleep retry_interval >>= fun () ->
-        _bind_with_retry socket src_port retry_interval
-    | exn ->
-        (* Unexpected error: re-raise *)
-        Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string exn);
-        flush stderr;
-        Lwt.fail exn)
-
-(* Retry mechanism for Lwt_unix.connect *)
-let rec _connect_with_retry socket addr retry_interval =
-  Lwt.catch
-    (fun () ->
-      Lwt_unix.connect socket addr >>= fun () ->
-      Lwt.return_unit)
-    (function
-    | Unix.Unix_error (Unix.EADDRNOTAVAIL, _, _) ->
-        (* Log and retry *)
-        (* Printf.eprintf "EADDRNOTAVAIL: Retrying in %.1f seconds...\n" retry_interval;
-        flush stderr; *)
-        Lwt_unix.sleep retry_interval >>= fun () ->
-        _connect_with_retry socket addr retry_interval
-    | Unix.Unix_error (Unix.EADDRINUSE, _, _) ->
-        (* Log and retry *)
-        (* Printf.eprintf "EADDRINUSE: Retrying in %.1f seconds...\n" retry_interval;
-        flush stderr; *)
-        Lwt_unix.sleep retry_interval >>= fun () ->
-        _connect_with_retry socket addr retry_interval
-    | exn ->
-        (* Unexpected errors *)
-        Printf.eprintf "Unexpected error: %s\n" (Printexc.to_string exn);
-        flush stderr;
-        Lwt.fail exn)
-
-
-
 
 (* Call AppendEntriesRPC *)
 let call_append_entries port prev_log_index entries =
@@ -422,17 +371,13 @@ let batch_loop () =
   let rec loop () =
     let batch_timeout = 0.05 in
     Lwt_unix.sleep batch_timeout >>= fun () ->
-      (* Check for new entries based on commit_index *)
-      let verify_index (entry: Raftkv.LogEntry.t) =
-        entry.index > !commit_index in
+      
       Mutex.lock log_mutex;
-      let new_entries = List.filter verify_index !log in
       let new_commit_index = List.length !log - 1 in
-      let next_prev_log_index = new_commit_index in
       Mutex.unlock log_mutex;
-
-      if !role = "leader" && List.length new_entries > 0 then (
-        Printf.printf "Batch loop detected %d new entries\n" (List.length new_entries);
+     
+      if !role = "leader" && !last_batch < new_commit_index then (
+        Printf.printf "Batch loop detected %d new entries\n" (new_commit_index - !last_batch);
         flush stdout;
 
         (* Condition to wait for majority to commit *)
@@ -443,10 +388,14 @@ let batch_loop () =
         let all_server_ids = List.init !num_servers (fun i -> i + 1) in
         List.iter (fun server_id ->
           if server_id <> !id then 
+            let idx = server_id - 1 in
+            let prev_log_index = (List.nth !next_index idx) - 1 in
+            let verify_index (entry: Raftkv.LogEntry.t) =
+              entry.index > prev_log_index && entry.index <= new_commit_index in
+            let new_entries = List.filter verify_index !log in
             Lwt.async (fun () ->
               let port = 9000 + server_id in
-              let prev_log_index_capture = !prev_log_index in
-              call_append_entries port prev_log_index_capture new_entries >>= fun res ->
+              call_append_entries port prev_log_index new_entries >>= fun res ->
               match res with
               | Ok (v, _) -> 
                 let _res_term = v.term in
@@ -455,6 +404,10 @@ let batch_loop () =
                   state.successful_replies <- state.successful_replies + 1;
                   Printf.printf "AppendEntries RPC to server %d successful, replies: %d\n" server_id state.successful_replies;
                   flush stdout;
+                  Mutex.lock next_index_mutex;
+                  next_index := List.mapi (fun i x -> if i = idx then new_commit_index + 1 else x) !next_index;
+                  match_index := List.mapi (fun i x -> if i = idx then new_commit_index else x) !match_index;
+                  Mutex.unlock next_index_mutex;
                   if state.successful_replies >= (!num_servers / 2) then (
                     
                     (* A log entry is committed once the leader
@@ -467,13 +420,17 @@ let batch_loop () =
                       commit_index := new_commit_index;
                     Lwt_condition.signal state.majority_condition ();
                   );
+                ) else (
+                  Printf.printf "AppendEntries RPC to server %d failed\n" server_id;
+                  flush stdout;
                 );
                 Lwt.return ()
               | Error _ -> 
                 Lwt.return ()
             )
+
         ) all_server_ids;
-        prev_log_index := next_prev_log_index;
+        last_batch := new_commit_index;
         Lwt_condition.wait state.majority_condition >>= fun () ->
         apply_commited_entries ();
         (* Majority condition reached, signal requests that they are ok to respond to client *)
@@ -571,7 +528,8 @@ let send_heartbeats () =
         let port = 9000 + server_id in
         (* Printf.printf "Leader: Sending heartbeat with prev_log_index: %d\n" !prev_log_index;
         flush stdout; *)
-        call_append_entries port !prev_log_index [] >>= fun res ->
+        let prev_log_index = List.nth !next_index (server_id - 1) - 1 in
+        call_append_entries port prev_log_index [] >>= fun res ->
         match res with
         | Ok (_, _) -> 
             (* if not res.success then
@@ -637,9 +595,14 @@ let count_votes () =
   if List.length !votes_received >= majority then (
     (* If we've received a majority, we win the election *)
     Printf.printf "We have a majority of votes (%d/%d).\n" (List.length !votes_received) total_servers;
-    role := "leader";
     leader_id := !id;
     prev_log_index := List.length !log - 1;
+    Mutex.lock log_mutex;
+    next_index := List.init !num_servers (fun _ -> List.length !log);
+    Mutex.unlock log_mutex;
+    match_index := List.init !num_servers (fun _ -> -1);
+
+    role := "leader";
     ignore(call_new_leader ());
     Lwt.async (fun () -> heartbeat_loop ())
   )
@@ -825,6 +788,7 @@ Lwt.async (fun () ->
   commit_index := -1;
   last_applied := -1;
   prev_log_index := -1;
+  last_batch := -1;
 
   (* Start election timeout *)
   Lwt.async election_loop;
