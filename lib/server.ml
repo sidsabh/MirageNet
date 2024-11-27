@@ -363,6 +363,61 @@ let call_append_entries port prev_log_index entries =
     ()
 
 
+let rec send_entries idx state new_commit_index =
+  let prev_log_index = (List.nth !next_index idx) - 1 in
+  let verify_index (entry: Raftkv.LogEntry.t) =
+    entry.index > prev_log_index && entry.index <= new_commit_index in
+  let new_entries = List.filter verify_index !log in
+  Lwt.async (fun () ->
+    let port = 9000 + idx + 1 in
+    call_append_entries port prev_log_index new_entries >>= fun res ->
+    match res with
+    | Ok (v, _) -> 
+      let _res_term = v.term in
+      let res_success = v.success in
+      if res_success then (
+        state.successful_replies <- state.successful_replies + 1;
+        Printf.printf "AppendEntries RPC to server %d successful, replies: %d\n" (idx + 1) state.successful_replies;
+        flush stdout;
+        Mutex.lock next_index_mutex;
+        next_index := List.mapi (fun i x -> if i = idx then new_commit_index + 1 else x) !next_index;
+        match_index := List.mapi (fun i x -> if i = idx then new_commit_index else x) !match_index;
+        Mutex.unlock next_index_mutex;
+        if state.successful_replies >= (!num_servers / 2) then (
+          
+          (* A log entry is committed once the leader
+          that created the entry has replicated it on a majority of
+          the servers (e.g., entry 7 in Figure 6). This also commits
+          all preceding entries in the leader’s log, including entries
+          created by previous leaders. *)
+          
+          if (new_commit_index > !commit_index) then
+            commit_index := new_commit_index;
+          Lwt_condition.signal state.majority_condition ();
+        );
+      ) else (
+        (* if term matches current term, decrease nextIndex[i] and try again *)
+        let res_term = v.term in
+        if res_term <> !term then (
+          Printf.printf "AppendEntries RPC to server %d failed, term mismatch\n" (idx + 1);
+          flush stdout;
+          term := res_term;
+          role := "follower";
+          voted_for := 0;
+          votes_received := [];
+        ) else (
+          Mutex.lock next_index_mutex;
+          next_index := List.mapi (fun i x -> if i = idx then x - 1 else x) !next_index;
+          Mutex.unlock next_index_mutex;
+          Printf.printf "AppendEntries RPC to server %d failed, trying again with nextIndex: %d\n" (idx + 1) (List.nth !next_index idx);
+          flush stdout;
+          send_entries idx state new_commit_index
+        )
+      );
+      Lwt.return ()
+    | Error _ -> 
+      Lwt.return ()
+  )
 
 
 
@@ -389,45 +444,7 @@ let batch_loop () =
         List.iter (fun server_id ->
           if server_id <> !id then 
             let idx = server_id - 1 in
-            let prev_log_index = (List.nth !next_index idx) - 1 in
-            let verify_index (entry: Raftkv.LogEntry.t) =
-              entry.index > prev_log_index && entry.index <= new_commit_index in
-            let new_entries = List.filter verify_index !log in
-            Lwt.async (fun () ->
-              let port = 9000 + server_id in
-              call_append_entries port prev_log_index new_entries >>= fun res ->
-              match res with
-              | Ok (v, _) -> 
-                let _res_term = v.term in
-                let res_success = v.success in
-                if res_success then (
-                  state.successful_replies <- state.successful_replies + 1;
-                  Printf.printf "AppendEntries RPC to server %d successful, replies: %d\n" server_id state.successful_replies;
-                  flush stdout;
-                  Mutex.lock next_index_mutex;
-                  next_index := List.mapi (fun i x -> if i = idx then new_commit_index + 1 else x) !next_index;
-                  match_index := List.mapi (fun i x -> if i = idx then new_commit_index else x) !match_index;
-                  Mutex.unlock next_index_mutex;
-                  if state.successful_replies >= (!num_servers / 2) then (
-                    
-                    (* A log entry is committed once the leader
-                    that created the entry has replicated it on a majority of
-                    the servers (e.g., entry 7 in Figure 6). This also commits
-                    all preceding entries in the leader’s log, including entries
-                    created by previous leaders. *)
-                    
-                    if (new_commit_index > !commit_index) then
-                      commit_index := new_commit_index;
-                    Lwt_condition.signal state.majority_condition ();
-                  );
-                ) else (
-                  Printf.printf "AppendEntries RPC to server %d failed\n" server_id;
-                  flush stdout;
-                );
-                Lwt.return ()
-              | Error _ -> 
-                Lwt.return ()
-            )
+            send_entries idx state new_commit_index
 
         ) all_server_ids;
         last_batch := new_commit_index;
