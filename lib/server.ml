@@ -142,7 +142,7 @@ let election_timeout_condition = Lwt_condition.create ()
 let start_election_timeout () =
   let rec loop () =
     (* Generate a random election timeout duration between 0.15s and 0.3s *)
-    let timeout_duration = 0.5 +. (Random.float (1. -. 0.5)) in
+    let timeout_duration = 0.15 +. (Random.float (0.3 -. 0.15)) in
     (* Printf.printf "Election timeout set to %f seconds\n" timeout_duration;
     flush stdout; *)
 
@@ -725,7 +725,7 @@ let create_connection address port =
 (* Function to establish connections to all other servers *)
 let establish_connections () =
   (* Wait for 500 ms to give time for the other servers to spawn *)
-  Lwt_unix.sleep 0.5 >>= fun () ->
+  Lwt_unix.sleep 0.1 >>= fun () ->
 
   (* Loop through all server ports and establish connections to each one *)
   let rec establish_for_ports ports = 
