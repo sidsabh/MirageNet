@@ -2,6 +2,8 @@ open Lwt.Infix
 open Lwt.Syntax
 open Grpc_lwt
 
+let num_servers = 10
+
 let call_server address port =
   (* Setup Http/2 connection *)
   Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
@@ -17,7 +19,7 @@ let call_server address port =
   let encode, decode =
     Service.make_client_functions Raftkv.FrontEnd.startRaft
   in
-  let req = Raftkv.IntegerArg.make ~arg:4 () in
+  let req = Raftkv.IntegerArg.make ~arg:num_servers () in 
   let enc = encode req |> Writer.contents in
 
   Client.call ~service:"raftkv.FrontEnd" ~rpc:"StartRaft"

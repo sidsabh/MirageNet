@@ -3,11 +3,14 @@ open Grpc_lwt
 open Lwt.Infix
 open Lwt.Syntax
 open Raftkv
+open Ocaml_protoc_plugin
 
-(* Global vars *)
+(* Global state *)
 let num_servers = ref 0
 let leader_id = ref 1
-let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
+
+(* Disable SIGPIPE in case server down *)
+let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore 
 
 (* Call Server Get *)
 let call_server_get address server_id key client_id request_id =
@@ -21,7 +24,6 @@ let call_server_get address server_id key client_id request_id =
   H2_lwt_unix.Client.create_connection ~error_handler socket
   >>= fun connection ->
   (* code generation for RequestVote RPC *)
-  let open Ocaml_protoc_plugin in
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.get in
   let req =
     Raftkv.GetKey.make ~key ~clientId:client_id ~requestId:request_id ()
@@ -45,11 +47,12 @@ let call_server_get address server_id key client_id request_id =
     ()
 
 let send_get_request_to_leader address key clientId requestId =
+  (*  *)
   let rec loop () =
     call_server_get address !leader_id key clientId requestId >>= fun res ->
     match res with
     | Ok (res, _) ->
-        (* Spec: frontend may have to query the servers to find out who the current leader is *)
+  (* Spec: frontend may have to query the servers to find out who the current leader is *)
         let wrong_leader = res.wrongLeader in
         let _error = res.error in
         let value = res.value in
@@ -74,9 +77,7 @@ let send_get_request_to_leader address key clientId requestId =
 
 (* Decode the incoming GetKey request *)
 let handle_get_request buffer =
-  let open Ocaml_protoc_plugin in
-  let open Raftkv in
-  let decode, encode = Service.make_service_functions FrontEnd.get in
+  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.get in
 
   let request =
     Reader.create buffer |> decode |> function
@@ -108,7 +109,7 @@ let handle_get_request buffer =
 
   (* Reply to the client *)
   let reply =
-    FrontEnd.Get.Response.make ~wrongLeader:res_wrong_leader ~error:res_error
+    Raftkv.FrontEnd.Get.Response.make ~wrongLeader:res_wrong_leader ~error:res_error
       ~value:res_value ()
   in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
@@ -125,7 +126,6 @@ let call_server_put address server_id key value client_id request_id =
   H2_lwt_unix.Client.create_connection ~error_handler socket
   >>= fun connection ->
   (* code generation for RequestVote RPC *)
-  let open Ocaml_protoc_plugin in
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.put in
   let req =
     Raftkv.KeyValue.make ~key ~value ~clientId:client_id ~requestId:request_id
@@ -179,9 +179,7 @@ let send_put_request_to_leader address key value clientId requestId =
 
 (* Handle Put *)
 let handle_put_request buffer =
-  let open Ocaml_protoc_plugin in
-  let open Raftkv in
-  let decode, encode = Service.make_service_functions FrontEnd.put in
+  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.put in
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
@@ -211,7 +209,7 @@ let handle_put_request buffer =
 
       (* Reply to the client *)
       let reply =
-        FrontEnd.Put.Response.make ~wrongLeader:res_wrong_leader
+        Raftkv.FrontEnd.Put.Response.make ~wrongLeader:res_wrong_leader
           ~error:res_error ~value:res_value ()
       in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
@@ -222,9 +220,7 @@ let handle_put_request buffer =
 (* Handle Replace *)
 (* TODO: Finish *)
 let handle_replace_request buffer =
-  let open Ocaml_protoc_plugin in
-  let open Raftkv in
-  let decode, encode = Service.make_service_functions FrontEnd.replace in
+  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.replace in
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
@@ -232,7 +228,7 @@ let handle_replace_request buffer =
         v.key v.value;
       flush stdout;
       let reply =
-        FrontEnd.Replace.Response.make ~wrongLeader:false ~error:"" ()
+        Raftkv.FrontEnd.Replace.Response.make ~wrongLeader:false ~error:"" ()
       in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e ->
@@ -254,9 +250,7 @@ let spawn_server i =
 
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
-  let open Ocaml_protoc_plugin in
-  let open Raftkv in
-  let decode, encode = Service.make_service_functions FrontEnd.startRaft in
+  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.startRaft in
   let request =
     Reader.create buffer |> decode |> function
     | Ok v ->
@@ -274,15 +268,13 @@ let handle_start_raft_request buffer =
   done;
 
   let reply =
-    FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" ()
+    Raftkv.FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" ()
   in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
 (* Handle New Leader *)
 let handle_new_leader_request buffer =
-  let open Ocaml_protoc_plugin in
-  let open Raftkv in
-  let decode, encode = Service.make_service_functions FrontEnd.newLeader in
+  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.newLeader in
   let request =
     Reader.create buffer |> decode |> function
     | Ok v ->
@@ -296,7 +288,7 @@ let handle_new_leader_request buffer =
   in
   leader_id := request;
 
-  let reply = FrontEnd.NewLeader.Response.make () in
+  let reply = Raftkv.FrontEnd.NewLeader.Response.make () in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
 (* Create FrontEnd service with all RPCs *)

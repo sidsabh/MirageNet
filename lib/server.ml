@@ -68,7 +68,8 @@ let handle_get_request buffer =
       flush stdout;
       let value =
         try Hashtbl.find state v.key
-        with Not_found -> failwith "Key not found"
+        (* with Not_found -> failwith "Key not found" *)
+        with Not_found -> "Key not found"
       in
       let reply =
         KeyValueStore.Get.Response.make ~wrongLeader:false ~error:"" ~value ()
@@ -680,7 +681,8 @@ let count_votes () =
     match_index := List.init !num_servers (fun _ -> -1);
 
     role := "leader";
-    ignore (call_new_leader ());
+    (* Tell frontend we are the new leader *)
+    ignore (call_new_leader ()); 
     Lwt.async (fun () -> heartbeat_loop ()))
   else
     (* Otherwise, we need to continue gathering votes *)
