@@ -7,7 +7,6 @@ open Raftkv
 (* Global vars *)
 let num_servers = ref 0
 let leader_id = ref 1
-
 let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
 
 (* Call Server Get *)
@@ -17,57 +16,59 @@ let call_server_get address server_id key client_id request_id =
   Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
   >>= fun addresses ->
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
-  >>= fun () ->
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
   H2_lwt_unix.Client.create_connection ~error_handler socket
   >>= fun connection ->
-
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.get in
-  let req = Raftkv.GetKey.make ~key ~clientId: client_id ~requestId: request_id () in 
+  let req =
+    Raftkv.GetKey.make ~key ~clientId:client_id ~requestId:request_id ()
+  in
   let enc = encode req |> Writer.contents in
 
   Grpc_lwt.Client.call ~service:"raftkv.KeyValueStore" ~rpc:"Get"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
-            let+ decoder = decoder in
-            match decoder with
-            | Some decoder -> (
-                Reader.create decoder |> decode |> function
-                | Ok v -> v
-                | Error e ->
-                    failwith
-                      (Printf.sprintf "Could not decode request: %s"
+           let+ decoder = decoder in
+           match decoder with
+           | Some decoder -> (
+               Reader.create decoder |> decode |> function
+               | Ok v -> v
+               | Error e ->
+                   failwith
+                     (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Raftkv.KeyValueStore.Get.Response.make ()))
+           | None -> Raftkv.KeyValueStore.Get.Response.make ()))
     ()
 
 let send_get_request_to_leader address key clientId requestId =
   let rec loop () =
     call_server_get address !leader_id key clientId requestId >>= fun res ->
     match res with
-    | Ok (res, _) -> 
-      let wrong_leader = res.wrongLeader in
-      let _error = res.error in
-      let value = res.value in
-      if wrong_leader then (
-        leader_id := int_of_string value;
-        Printf.printf "Get: Leader is wrong, trying raftserver%d\n" !leader_id;
+    | Ok (res, _) ->
+        (* Spec: frontend may have to query the servers to find out who the current leader is *)
+        let wrong_leader = res.wrongLeader in
+        let _error = res.error in
+        let value = res.value in
+        if wrong_leader then (
+          leader_id := int_of_string value;
+          Printf.printf "Get: Leader is wrong, trying raftserver%d\n" !leader_id;
+          flush stdout;
+          loop ())
+        else (
+          Printf.printf "Get RPC to server %d successful, value: %s\n"
+            !leader_id value;
+          flush stdout;
+          Lwt.return res)
+    | Error _ ->
+        Printf.printf "Get RPC to server %d failed, trying next server\n"
+          !leader_id;
         flush stdout;
+        leader_id := !leader_id + 1;
         loop ()
-      ) else (
-        Printf.printf "Get RPC to server %d successful, value: %s\n" !leader_id value;
-        flush stdout;
-        Lwt.return res
-      )
-    | Error _ -> 
-      Printf.printf "Get RPC to server %d failed, trying next server\n" !leader_id;
-      flush stdout;
-      leader_id := !leader_id + 1;
-      loop ()
   in
   loop ()
 
@@ -80,22 +81,36 @@ let handle_get_request buffer =
   let request =
     Reader.create buffer |> decode |> function
     | Ok v -> v
-    | Error e -> 
-        failwith (Printf.sprintf "Could not decode GetKey request: %s" (Result.show_error e))
+    | Error e ->
+        failwith
+          (Printf.sprintf "Could not decode GetKey request: %s"
+             (Result.show_error e))
   in
 
-  Printf.printf "Received Get request:\n{\n\t\"key\": \"%s\"\n\t\"ClientId\": %d\n\t\"RequestId\": %d\n}\n" request.key request.clientId request.requestId;
+  Printf.printf
+    "Received Get request:\n\
+     {\n\
+     \t\"key\": \"%s\"\n\
+     \t\"ClientId\": %d\n\
+     \t\"RequestId\": %d\n\
+     }\n"
+    request.key request.clientId request.requestId;
   flush stdout;
 
   (* Find the leader *)
-  let* res = send_get_request_to_leader "localhost" request.key request.clientId request.requestId in
+  let* res =
+    send_get_request_to_leader "localhost" request.key request.clientId
+      request.requestId
+  in
   let res_wrong_leader = res.wrongLeader in
   let res_error = res.error in
   let res_value = res.value in
 
   (* Reply to the client *)
-
-  let reply = FrontEnd.Get.Response.make ~wrongLeader:res_wrong_leader ~error:res_error ~value:res_value() in
+  let reply =
+    FrontEnd.Get.Response.make ~wrongLeader:res_wrong_leader ~error:res_error
+      ~value:res_value ()
+  in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
 (* Call server put *)
@@ -105,58 +120,60 @@ let call_server_put address server_id key value client_id request_id =
   Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
   >>= fun addresses ->
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr
-  >>= fun () ->
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
   H2_lwt_unix.Client.create_connection ~error_handler socket
   >>= fun connection ->
-
   (* code generation for RequestVote RPC *)
   let open Ocaml_protoc_plugin in
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.put in
-  let req = Raftkv.KeyValue.make ~key ~value ~clientId: client_id ~requestId: request_id () in 
+  let req =
+    Raftkv.KeyValue.make ~key ~value ~clientId:client_id ~requestId:request_id
+      ()
+  in
   let enc = encode req |> Writer.contents in
 
   Grpc_lwt.Client.call ~service:"raftkv.KeyValueStore" ~rpc:"Put"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
-            let+ decoder = decoder in
-            match decoder with
-            | Some decoder -> (
-                Reader.create decoder |> decode |> function
-                | Ok v -> v
-                | Error e ->
-                    failwith
-                      (Printf.sprintf "Could not decode request: %s"
+           let+ decoder = decoder in
+           match decoder with
+           | Some decoder -> (
+               Reader.create decoder |> decode |> function
+               | Ok v -> v
+               | Error e ->
+                   failwith
+                     (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-            | None -> Raftkv.KeyValueStore.Put.Response.make ()))
+           | None -> Raftkv.KeyValueStore.Put.Response.make ()))
     ()
-  
 
 let send_put_request_to_leader address key value clientId requestId =
   let rec loop () =
-    call_server_put address !leader_id key value clientId requestId >>= fun res ->
+    call_server_put address !leader_id key value clientId requestId
+    >>= fun res ->
     match res with
-    | Ok (res, _) -> 
-      let wrong_leader = res.wrongLeader in
-      let _error = res.error in
-      let value = res.value in
-      if wrong_leader then (
-        leader_id := int_of_string value;
-        Printf.printf "Leader is wrong, trying raftserver%d\n" !leader_id;
+    | Ok (res, _) ->
+        let wrong_leader = res.wrongLeader in
+        let _error = res.error in
+        let value = res.value in
+        if wrong_leader then (
+          leader_id := int_of_string value;
+          Printf.printf "Leader is wrong, trying raftserver%d\n" !leader_id;
+          flush stdout;
+          loop ())
+        else (
+          Printf.printf "Put RPC to server %d successful, value: %s\n"
+            !leader_id value;
+          flush stdout;
+          Lwt.return res)
+    | Error _ ->
+        Printf.printf "Put RPC to server %d failed, trying next server\n"
+          !leader_id;
         flush stdout;
+        leader_id := !leader_id + 1;
         loop ()
-      ) else (
-        Printf.printf "Put RPC to server %d successful, value: %s\n" !leader_id value;
-        flush stdout;
-        Lwt.return res
-      )
-    | Error _ -> 
-      Printf.printf "Put RPC to server %d failed, trying next server\n" !leader_id;
-      flush stdout;
-      leader_id := !leader_id + 1;
-      loop ()
   in
   loop ()
 
@@ -168,27 +185,42 @@ let handle_put_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
-    let key = v.key in
-    let value = v.value in
-    let clientId = v.clientId in
-    let requestId = v.requestId in
+      let key = v.key in
+      let value = v.value in
+      let clientId = v.clientId in
+      let requestId = v.requestId in
 
-    Printf.printf "Received Put request:\n{\n\t\"key\": \"%s\"\n\t\"value\": \"%s\"\n\t\"ClientId\": %d\n\t\"RequestId\": %d\n}\n" key value clientId requestId;
-    flush stdout;
+      Printf.printf
+        "Received Put request:\n\
+         {\n\
+         \t\"key\": \"%s\"\n\
+         \t\"value\": \"%s\"\n\
+         \t\"ClientId\": %d\n\
+         \t\"RequestId\": %d\n\
+         }\n"
+        key value clientId requestId;
+      flush stdout;
 
-    (* Find the leader *)
-    let* res = send_put_request_to_leader "localhost" key value clientId requestId in
-    let res_wrong_leader = res.wrongLeader in
-    let res_error = res.error in
-    let res_value = res.value in
-    
-    (* Reply to the client *)
-    
-    let reply = FrontEnd.Put.Response.make ~wrongLeader:res_wrong_leader ~error:res_error ~value:res_value() in
-    Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-  | Error e -> failwith (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
+      (* Find the leader *)
+      let* res =
+        send_put_request_to_leader "localhost" key value clientId requestId
+      in
+      let res_wrong_leader = res.wrongLeader in
+      let res_error = res.error in
+      let res_value = res.value in
+
+      (* Reply to the client *)
+      let reply =
+        FrontEnd.Put.Response.make ~wrongLeader:res_wrong_leader
+          ~error:res_error ~value:res_value ()
+      in
+      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+  | Error e ->
+      failwith
+        (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
 (* Handle Replace *)
+(* TODO: Finish *)
 let handle_replace_request buffer =
   let open Ocaml_protoc_plugin in
   let open Raftkv in
@@ -196,41 +228,54 @@ let handle_replace_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
-      Printf.printf "Received Replace request with key: %s and value: %s\n" v.key v.value;
-      let reply = FrontEnd.Replace.Response.make ~wrongLeader:false ~error:"" () in
+      Printf.printf "Received Replace request with key: %s and value: %s\n"
+        v.key v.value;
+      flush stdout;
+      let reply =
+        FrontEnd.Replace.Response.make ~wrongLeader:false ~error:"" ()
+      in
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-  | Error e -> failwith (Printf.sprintf "Error decoding Replace request: %s" (Result.show_error e))
+  | Error e ->
+      failwith
+        (Printf.sprintf "Error decoding Replace request: %s"
+           (Result.show_error e))
 
 (* spawn server processes *)
 let spawn_server i =
   let name = "raftserver" ^ string_of_int i in
-  let command = Printf.sprintf 
-    "strace -o strace_raftserver%d ./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; fflush()}' >> raft.log &"
-    i i !num_servers name i in
+  (* TODO: Find better way to call *)
+  let command =
+    Printf.sprintf
+      "./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; \
+       fflush()}' >> raft.log &"
+      i !num_servers name i
+  in
   ignore (Sys.command command)
-
-
 
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
   let open Ocaml_protoc_plugin in
   let open Raftkv in
   let decode, encode = Service.make_service_functions FrontEnd.startRaft in
-  let request = 
+  let request =
     Reader.create buffer |> decode |> function
     | Ok v ->
-      Printf.printf "Received StartRaft request with arg: %d\n" v;
-      flush stdout;
-      v
-    | Error e -> failwith (Printf.sprintf "Error decoding StartRaft request: %s" (Result.show_error e))
+        Printf.printf "Received StartRaft request with arg: %d\n" v;
+        flush stdout;
+        v
+    | Error e ->
+        failwith
+          (Printf.sprintf "Error decoding StartRaft request: %s"
+             (Result.show_error e))
   in
   num_servers := request;
   for i = 1 to request do
     ignore (spawn_server i)
   done;
-  
 
-  let reply = FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" () in
+  let reply =
+    FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" ()
+  in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
 (* Handle New Leader *)
@@ -238,20 +283,22 @@ let handle_new_leader_request buffer =
   let open Ocaml_protoc_plugin in
   let open Raftkv in
   let decode, encode = Service.make_service_functions FrontEnd.newLeader in
-  let request = 
+  let request =
     Reader.create buffer |> decode |> function
     | Ok v ->
-      Printf.printf "Received NewLeader request with arg: %d\n" v;
-      flush stdout;
-      v
-    | Error e -> failwith (Printf.sprintf "Error decoding NewLeader request: %s" (Result.show_error e))
+        Printf.printf "Received NewLeader request with arg: %d\n" v;
+        flush stdout;
+        v
+    | Error e ->
+        failwith
+          (Printf.sprintf "Error decoding NewLeader request: %s"
+             (Result.show_error e))
   in
   leader_id := request;
-  
 
   let reply = FrontEnd.NewLeader.Response.make () in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-    
+
 (* Create FrontEnd service with all RPCs *)
 let frontend_service =
   Server.Service.(
@@ -264,12 +311,9 @@ let frontend_service =
     |> handle_request)
 
 let server =
-  Server.(
-    v ()
-    |> add_service ~name:"raftkv.FrontEnd" ~service:frontend_service)
+  Server.(v () |> add_service ~name:"raftkv.FrontEnd" ~service:frontend_service)
 
 let () =
-  let open Lwt.Syntax in
   let port = 8001 in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
 
@@ -283,9 +327,9 @@ let () =
       let+ _server =
         Lwt_io.establish_server_with_client_socket listen_address server
       in
-      Printf.printf "Frontend service listening on port %i for grpc requests\n" port;
+      Printf.printf "Frontend service listening on port %i for grpc requests\n"
+        port;
       flush stdout);
 
   let forever, _ = Lwt.wait () in
   Lwt_main.run forever
-

@@ -34,7 +34,7 @@ $(BIN_DIR):
 up: $(BIN_DIR)/frontend $(BIN_DIR)/server
 	rm -f strace_*
 	rm -f $(LOG_FILE)
-	strace -o strace_frontend $(BIN_DIR)/frontend 2>&1 | awk '{print "frontend: " $$0; fflush()}' >> $(LOG_FILE) &
+	$(BIN_DIR)/frontend 2>&1 | awk '{print "frontend: " $$0; fflush()}' >> $(LOG_FILE) &
 
 # Rule to kill the frontend and server processes
 down:
