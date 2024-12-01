@@ -10,7 +10,7 @@ open Common
 let num_servers = ref 0
 
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
-  Hashtbl.create 31
+  Hashtbl.create Common.max_connections
 
 let leader_id = ref 1
 
@@ -159,7 +159,7 @@ let spawn_server i =
 let connect_server i =
   let port = i + 9000 in
   let* addresses =
-    Lwt_unix.getaddrinfo "localhost" (string_of_int port)
+    Lwt_unix.getaddrinfo Common.hostname (string_of_int port)
       [ Unix.(AI_FAMILY PF_INET) ]
   in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in

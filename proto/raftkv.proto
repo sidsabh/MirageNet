@@ -60,7 +60,7 @@ message LogEntry {
 message AppendEntriesRequest {
   int32 term = 1;
   int32 leader_id = 2;
-  int32 prev_log_index = 3;
+  int32 commit_length = 3;
   int32 prev_log_term = 4;
   repeated LogEntry entries = 5; // The log entries to append
   int32 leader_commit = 6;

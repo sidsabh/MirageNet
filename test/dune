@@ -23,6 +23,19 @@
   h2-lwt-unix))
 
 (executable
+ (name test_frontend_replace)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  raftkv
+  h2
+  h2-lwt-unix))
+
+
+(executable
  (name test_frontend_start_raft)
  (libraries
   grpc

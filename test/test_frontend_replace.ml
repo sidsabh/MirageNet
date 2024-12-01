@@ -2,7 +2,8 @@ open Lwt.Infix
 open Lwt.Syntax
 open Grpc_lwt
 
-let call_append_entries address port =
+let call_replace address port =
+  (* Setup Http/2 connection *)
   let* addresses =
     Lwt_unix.getaddrinfo address (string_of_int port)
       [ Unix.(AI_FAMILY PF_INET) ]
@@ -16,22 +17,14 @@ let call_append_entries address port =
 
   let open Ocaml_protoc_plugin in
   let open Raftkv in
-  let encode, decode =
-    Service.make_client_functions Raftkv.KeyValueStore.appendEntries
-  in
-  let entries =
-    [
-      Raftkv.LogEntry.make ~term:1 ~command:"command1" ();
-      Raftkv.LogEntry.make ~term:1 ~command:"command2" ();
-    ]
-  in
+  let encode, decode = Service.make_client_functions Raftkv.FrontEnd.replace in
   let req =
-    Raftkv.AppendEntriesRequest.make ~term:1 ~leader_id:2 ~commit_length:3
-      ~prev_log_term:4 ~entries ~leader_commit:6 ()
+    Raftkv.KeyValue.make ~key:"1" ~value:"new_command" ~clientId:1 ~requestId:3
+      ()
   in
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
+  Client.call ~service:"raftkv.FrontEnd" ~rpc:"Replace"
     ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
     ~handler:
       (Client.Rpc.unary enc ~f:(fun decoder ->
@@ -44,29 +37,17 @@ let call_append_entries address port =
                    failwith
                      (Printf.sprintf "Could not decode request: %s"
                         (Result.show_error e)))
-           | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
+           | None -> Raftkv.FrontEnd.Replace.Response.make ()))
     ()
 
 let () =
   let open Lwt.Syntax in
-  let port = 9001 in
+  let port = 8001 in
   let address = "localhost" in
   Lwt_main.run
-    (let+ res = call_append_entries address port in
+    (let+ res = call_replace address port in
      match res with
      | Ok (res, _) ->
-         (* Handle successful response and print details *)
-         let res_term = res.term in
-         let res_success = res.success in
-         Printf.printf
-           "Received AppendEntries response:\n\
-            {\n\
-            \t\"term\": %d\n\
-            \t\"success\": %b\n\
-            }\n"
-           res_term res_success;
-         flush stdout
-     | Error _ ->
-         (* Handle failure *)
-         Printf.printf "AppendEntries RPC failed\n";
-         flush stdout)
+         let value = res.value in
+         print_endline value
+     | Error _ -> print_endline "an error occurred")

@@ -19,7 +19,7 @@ let call_put address port =
   let open Raftkv in
   let encode, decode = Service.make_client_functions Raftkv.FrontEnd.put in
   let req =
-    Raftkv.KeyValue.make ~key:"1" ~value:"test_command" ~clientId:2 ~requestId:3
+    Raftkv.KeyValue.make ~key:"1" ~value:"test_command" ~clientId:1 ~requestId:2
       ()
   in
   let enc = encode req |> Writer.contents in

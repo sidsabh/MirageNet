@@ -1,5 +1,8 @@
 open Lwt.Syntax
 
+let hostname = "localhost"
+let max_connections = 31
+
 (* Function to gracefully close all sockets *)
 let close_all_sockets connections =
   Printf.printf "Received SIGTERM, shutting down, closing all sockets\n";

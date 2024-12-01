@@ -6,11 +6,6 @@ open Lwt.Syntax
 open Lwt.Infix
 open Common
 
-type append_entry_state = {
-  mutable successful_replies : int;
-  majority_condition : unit Lwt_condition.t;
-}
-
 (* Constants *)
 let heartbeat_timeout = 0.1
 let batch_timeout = 0.05
@@ -20,14 +15,14 @@ let id = ref 0
 let num_servers = ref 0
 
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
-  Hashtbl.create 31
+  Hashtbl.create Common.max_connections
 
 (* Persistent state on all servers *)
 let term = ref 0
 let voted_for = ref 0
 let log : Raftkv.LogEntry.t list ref = ref []
 let log_mutex = Lwt_mutex.create () (* Mutex to protect the log *)
-let prev_log_index = ref (-1)
+let commit_length = ref (-1)
 
 (* Volatile state on all servers *)
 let commit_index = ref (-1)
@@ -48,8 +43,7 @@ let votes_received : int list ref = ref []
 let votes_mutex = Lwt_mutex.create ()
 
 (* Other*)
-let state_map = Hashtbl.create 31
-
+let kv_store = Hashtbl.create Common.max_connections
 
 (* File paths for persistence *)
 let state_file_path server_id =
@@ -60,25 +54,26 @@ type persistent_state = {
   term : int;
   voted_for : int;
   log : Raftkv.LogEntry.t list;
-  prev_log_index : int;
+  commit_length : int;
 }
 
 (* Save state to disk *)
 let save_state server_id =
-  let state = {
-    term = !term;
-    voted_for = !voted_for;
-    log = !log;
-    prev_log_index = !prev_log_index;
-  } in
+  let state =
+    {
+      term = !term;
+      voted_for = !voted_for;
+      log = !log;
+      commit_length = !commit_length;
+    }
+  in
   Lwt_mutex.with_lock log_mutex (fun () ->
       let file_path = state_file_path server_id in
       Lwt_io.with_file ~mode:Lwt_io.Output file_path (fun channel ->
           let data = Marshal.to_bytes state [] in
           Lwt_io.write_from_string_exactly channel
-            (Bytes.unsafe_to_string data) 0 (Bytes.length data)
-        )
-    )
+            (Bytes.unsafe_to_string data)
+            0 (Bytes.length data)))
 
 (* Load state from disk *)
 let load_state server_id =
@@ -86,27 +81,34 @@ let load_state server_id =
   if Sys.file_exists file_path then
     Lwt_io.with_file ~mode:Lwt_io.Input file_path (fun channel ->
         Lwt_io.read channel >>= fun data ->
-        let state =
-          Marshal.from_bytes (Bytes.of_string data) 0
-        in
+        let state = Marshal.from_bytes (Bytes.of_string data) 0 in
         Lwt_mutex.with_lock log_mutex (fun () ->
             term := state.term;
             voted_for := state.voted_for;
             log := state.log;
-            prev_log_index := state.prev_log_index;
-            Lwt.return_unit
-          )
-      )
-  else
-    Lwt.return_unit
+            commit_length := state.commit_length;
+            Lwt.return_unit))
+  else Lwt.return_unit
 
 let initialize_server_state server_id =
   load_state server_id >>= fun () ->
   Lwt.finalize
     (fun () ->
-       (* Perform server initialization logic here *)
-       Lwt.return_unit)
+      (* Perform server initialization logic here *)
+      Lwt.return_unit)
     (fun () -> save_state server_id)
+
+let append_entry key value =
+  (* add entry to log *)
+  let command = key ^ " " ^ value in
+  Lwt_mutex.with_lock log_mutex (fun () ->
+      let index = List.length !log in
+      let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command ~index () in
+      log := List.concat [ !log; [ new_log_entry ] ];
+      Lwt.return ())
+  >>= fun () ->
+  (* wait for batch condition for linearizability *)
+  Lwt_condition.wait batch_condition >>= fun () -> Lwt.return ()
 
 (* Handle GetState *)
 let handle_get_state_request buffer =
@@ -129,30 +131,52 @@ let handle_get_state_request buffer =
         (Printf.sprintf "Error decoding GetState request: %s"
            (Result.show_error e))
 
-(* Handle Get *)
-let handle_get_request buffer =
+(* Handle Put *)
+let handle_put_request buffer =
   let decode, encode =
-    Service.make_service_functions Raftkv.KeyValueStore.get
+    Service.make_service_functions Raftkv.KeyValueStore.put
   in
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
-      Printf.printf "Received Get request for key: %s\n" v.key;
-      flush stdout;
-      let value =
-        try
-          Hashtbl.find state_map v.key
-          (* with Not_found -> failwith "Key not found" *)
-        with Not_found -> "Key not found"
-      in
-      let reply =
-        Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:false ~error:""
-          ~value ()
-      in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      let req_key = v.key in
+      let req_value = v.value in
+      let req_client_id = v.clientId in
+      let req_request_id = v.requestId in
+
+      if !role <> "leader" then
+        let correct_leader = string_of_int !leader_id in
+        let reply =
+          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
+            ~value:correct_leader ()
+        in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      else (
+        Printf.printf
+          "Received Put request:\n\
+           {\n\
+           \t\"key\": \"%s\"\n\
+           \t\"value\": \"%s\"\n\
+           \t\"clientId\": %d\n\
+           \t\"requestId\": %d\n\
+           }\n"
+          req_key req_value req_client_id req_request_id;
+        flush stdout;
+        let value =
+          try
+            let already = Hashtbl.find kv_store req_key in
+            "ERROR: already in KV store, value=" ^already
+            with Not_found -> "Success"
+          in
+        let* _ = append_entry req_key req_value in
+        let reply =
+          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:""
+            ~value:value ()
+        in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
   | Error e ->
       failwith
-        (Printf.sprintf "Error decoding Get request: %s" (Result.show_error e))
+        (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
 (* Handle Replace *)
 let handle_replace_request buffer =
@@ -162,20 +186,76 @@ let handle_replace_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
-      Printf.printf "Received Replace request with key: %s and value: %s\n"
-        v.key v.value;
-      (* TODO: more to do here? *)
-      let reply =
-        Raftkv.KeyValueStore.Replace.Response.make ~wrongLeader:false ~error:""
-          ()
-      in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      let req_key = v.key in
+      let req_value = v.value in
+      let req_client_id = v.clientId in
+      let req_request_id = v.requestId in
+
+      if !role <> "leader" then
+        let correct_leader = string_of_int !leader_id in
+        let reply =
+          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
+            ~value:correct_leader ()
+        in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      else (
+        Printf.printf
+          "Received Replace request:\n\
+           {\n\
+           \t\"key\": \"%s\"\n\
+           \t\"value\": \"%s\"\n\
+           \t\"clientId\": %d\n\
+           \t\"requestId\": %d\n\
+           }\n"
+          req_key req_value req_client_id req_request_id;
+        flush stdout;
+        let value =
+          try
+            Hashtbl.find kv_store v.key
+            (* with Not_found -> failwith "Key not found" *)
+          with Not_found -> "SYSERROR: Key not found" in
+        let* _ = append_entry req_key req_value in
+        let reply =
+          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:""
+            ~value:("Old key:" ^ value) ()
+        in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
   | Error e ->
       failwith
-        (Printf.sprintf "Error decoding Replace request: %s"
-           (Result.show_error e))
+        (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
 
-(* RAFT CORE *)
+(* Handle Get *)
+let handle_get_request buffer =
+  let decode, encode =
+    Service.make_service_functions Raftkv.KeyValueStore.get
+  in
+  let request = Reader.create buffer |> decode in
+  match request with
+  | Ok v ->
+      if !role <> "leader" then
+        let correct_leader = string_of_int !leader_id in
+        let reply =
+          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
+            ~value:correct_leader ()
+        in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+      else (
+        Printf.printf "Received Get request for key: %s\n" v.key;
+        flush stdout;
+        let value =
+          try
+            Hashtbl.find kv_store v.key
+            (* with Not_found -> failwith "Key not found" *)
+          with Not_found -> "Key not found"
+        in
+        let reply =
+          Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:false ~error:""
+            ~value ()
+        in
+        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
+  | Error e ->
+      failwith
+        (Printf.sprintf "Error decoding Get request: %s" (Result.show_error e))
 
 (* Handle RequestVoteRPC *)
 let handle_request_vote buffer =
@@ -247,7 +327,7 @@ let apply_commited_entries () =
       Printf.printf "Applying log entry %d: %s\n" i entry.command;
       flush stdout;
       let key, value = Scanf.sscanf entry.command "%s %s" (fun k v -> (k, v)) in
-      Hashtbl.replace state_map key value;
+      Hashtbl.replace kv_store key value;
       last_applied := i;
       loop (i + 1))
   in
@@ -273,7 +353,7 @@ let handle_append_entries buffer =
   | Ok v ->
       let req_term = v.term in
       let req_leader_id = v.leader_id in
-      let req_prev_log_index = v.prev_log_index in
+      let req_commit_length = v.commit_length in
       let req_prev_log_term = v.prev_log_term in
       let req_entries = v.entries in
       let req_leader_commit = v.leader_commit in
@@ -318,13 +398,13 @@ let handle_append_entries buffer =
            {\n\
            \t\"term\": %d\n\
            \t\"leader_id\": %d\n\
-           \t\"prev_log_index\": %d\n\
+           \t\"commit_length\": %d\n\
            \t\"prev_log_term\": %d\n\
            \t\"entries\": [%s\n\
            \t]\n\
            \t\"leader_commit\": %d\n\
            }\n"
-          req_term req_leader_id req_prev_log_index req_prev_log_term
+          req_term req_leader_id req_commit_length req_prev_log_term
           (String.concat ", " (List.map log_entry_to_string req_entries))
           req_leader_commit;
         flush stdout);
@@ -340,44 +420,42 @@ let handle_append_entries buffer =
 
       (* Condition 2: Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm *)
       if
-        (not !return) && req_prev_log_index <> -1
-        && (List.length !log <= req_prev_log_index
-           || (List.nth !log req_prev_log_index).term <> req_prev_log_term)
+        (not !return) && req_commit_length <> -1
+        && (List.length !log <= req_commit_length
+           || (List.nth !log req_commit_length).term <> req_prev_log_term)
       then (
         if req_entries = [] then
-          Printf.printf
-            "Failing heartbeat, prev_log_index: %d, log length: %d\n"
-            req_prev_log_index (List.length !log);
+          Printf.printf "Failing heartbeat, commit_length: %d, log length: %d\n"
+            req_commit_length (List.length !log);
         flush stdout;
         ignore (success := false);
         ignore (return := true));
 
       let truncate_log_if_conflict (log : Raftkv.LogEntry.t list)
-          (entries : Raftkv.LogEntry.t list) (prev_log_index : int) :
+          (entries : Raftkv.LogEntry.t list) (commit_length : int) :
           Raftkv.LogEntry.t list =
         (* Define the starting index *)
         let rec loop i =
           if
-            i >= List.length log
-            || i - prev_log_index - 1 >= List.length entries
+            i >= List.length log || i - commit_length - 1 >= List.length entries
           then (* If out of bounds, stop *)
             log
           else
             let log_term = (List.nth log i).term in
-            let entry_term = (List.nth entries (i - prev_log_index - 1)).term in
+            let entry_term = (List.nth entries (i - commit_length - 1)).term in
             if log_term <> entry_term then
               (* If there is a conflict, truncate the log from index i *)
               List.filteri (fun idx _ -> idx < i) log
             else (* No conflict, continue to the next index *)
               loop (i + 1)
         in
-        loop (prev_log_index + 1)
+        loop (commit_length + 1)
       in
 
       (* Condition 3: If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it *)
       (if not !return then
-         (* Starting immediatly after prev_log_index, make sure log[i].term = entries[i-prev_log_index].term *)
-         truncate_log_if_conflict !log req_entries req_prev_log_index
+         (* Starting immediatly after commit_length, make sure log[i].term = entries[i-commit_length].term *)
+         truncate_log_if_conflict !log req_entries req_commit_length
          |> fun new_log -> log := new_log);
 
       let rec drop n lst =
@@ -393,10 +471,10 @@ let handle_append_entries buffer =
       (if not !return then
          let new_log_length = List.length !log in
          (* TODO: take the new entries from req_entries and append it to log *)
-         if new_log_length < req_prev_log_index + List.length req_entries + 1
+         if new_log_length < req_commit_length + List.length req_entries + 1
          then (
            let new_entries =
-             drop (new_log_length - (req_prev_log_index + 1)) req_entries
+             drop (new_log_length - (req_commit_length + 1)) req_entries
            in
            log := List.concat [ !log; new_entries ];
            (* Printf.printf "New log after appending entries: %s\n" (String.concat ", " (List.map log_entry_to_string !log)); *)
@@ -423,19 +501,19 @@ let handle_append_entries buffer =
            (Result.show_error e))
 
 (* Call AppendEntriesRPC *)
-let call_append_entries port prev_log_index entries =
+let call_append_entries port commit_length entries =
   let connection = Hashtbl.find server_connections port in
 
   let encode, decode =
     Service.make_client_functions Raftkv.KeyValueStore.appendEntries
   in
   let prev_log_term =
-    if prev_log_index < List.length !log && prev_log_index >= 0 then
-      (List.nth !log prev_log_index).term
+    if commit_length < List.length !log && commit_length >= 0 then
+      (List.nth !log commit_length).term
     else 0
   in
   let req =
-    Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~prev_log_index
+    Raftkv.AppendEntriesRequest.make ~term:!term ~leader_id:!id ~commit_length
       ~prev_log_term ~entries ~leader_commit:!commit_index ()
   in
   let enc = encode req |> Writer.contents in
@@ -456,16 +534,21 @@ let call_append_entries port prev_log_index entries =
            | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
     ()
 
+type append_entry_state = {
+  mutable successful_replies : int;
+  majority_condition : unit Lwt_condition.t;
+}
+
 (* Runs concurrently *)
 let rec send_entries follower_idx state new_commit_index =
-  let prev_log_index = List.nth !next_index follower_idx - 1 in
+  let commit_length = List.nth !next_index follower_idx - 1 in
   let verify_index (entry : Raftkv.LogEntry.t) =
-    entry.index > prev_log_index && entry.index <= new_commit_index
+    entry.index > commit_length && entry.index <= new_commit_index
   in
   let new_entries = List.filter verify_index !log in
   Lwt.async (fun () ->
       let port = 9001 + follower_idx in
-      let* res = call_append_entries port prev_log_index new_entries in
+      let* res = call_append_entries port commit_length new_entries in
       match res with
       | Ok (v, _) ->
           let _res_term = v.term in
@@ -569,59 +652,6 @@ let rec batch_loop () =
   in
   batch_loop ()
 
-let append_entry key value =
-  (* add entry to log *)
-  let command = key ^ " " ^ value in
-  Lwt_mutex.with_lock log_mutex (fun () ->
-      let index = List.length !log in
-      let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command ~index () in
-      log := List.concat [ !log; [ new_log_entry ] ];
-      Lwt.return ())
-  >>= fun () ->
-  (* wait for batch condition for linearizability *)
-  Lwt_condition.wait batch_condition >>= fun () -> Lwt.return ()
-
-(* Handle Put *)
-let handle_put_request buffer =
-  let decode, encode =
-    Service.make_service_functions Raftkv.KeyValueStore.put
-  in
-  let request = Reader.create buffer |> decode in
-  match request with
-  | Ok v ->
-      let req_key = v.key in
-      let req_value = v.value in
-      let req_client_id = v.clientId in
-      let req_request_id = v.requestId in
-
-      if !role <> "leader" then
-        let correct_leader = string_of_int !leader_id in
-        let reply =
-          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
-            ~value:correct_leader ()
-        in
-        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-      else (
-        Printf.printf
-          "Received Put request:\n\
-           {\n\
-           \t\"key\": \"%s\"\n\
-           \t\"value\": \"%s\"\n\
-           \t\"clientId\": %d\n\
-           \t\"requestId\": %d\n\
-           }\n"
-          req_key req_value req_client_id req_request_id;
-        flush stdout;
-        let* _ = append_entry req_key req_value in
-        let reply =
-          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:""
-            ~value:"Success" ()
-        in
-        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
-  | Error e ->
-      failwith
-        (Printf.sprintf "Error decoding Put request: %s" (Result.show_error e))
-
 (* Call RequestVoteRPC *)
 let call_request_vote port candidate_id term last_log_index last_log_term =
   let connection = Hashtbl.find server_connections port in
@@ -661,10 +691,10 @@ let send_heartbeats () =
     (fun server_id ->
       (* Don't request a vote from yourself *)
       let port = 9000 + server_id in
-      (* Printf.printf "Leader: Sending heartbeat with prev_log_index: %d\n" !prev_log_index;
+      (* Printf.printf "Leader: Sending heartbeat with commit_length: %d\n" !commit_length;
          flush stdout; *)
-      let prev_log_index = List.nth !next_index (server_id - 1) - 1 in
-      let* res = call_append_entries port prev_log_index [] in
+      let commit_length = List.nth !next_index (server_id - 1) - 1 in
+      let* res = call_append_entries port commit_length [] in
       match res with
       | Ok (_, _) ->
           (* if not res.success then
@@ -691,7 +721,7 @@ let count_votes num_votes_received =
     Printf.printf "We have a majority of votes (%d/%d) at term %d.\n"
       num_votes_received total_servers !term;
     leader_id := !id;
-    prev_log_index := List.length !log - 1;
+    commit_length := List.length !log - 1;
     let _ =
       Lwt_mutex.with_lock log_mutex (fun () ->
           next_index := List.init !num_servers (fun _ -> List.length !log);
@@ -821,7 +851,7 @@ let establish_connections () =
     match ports with
     | [] -> Lwt.return ()
     | port :: rest ->
-        create_connection "localhost" port >>= fun () ->
+        create_connection Common.hostname port >>= fun () ->
         establish_for_ports rest
   in
 
@@ -870,9 +900,9 @@ let () =
   Random.self_init ();
   Random.init ((Unix.time () |> int_of_float) + !id);
   setup_signal_handler server_connections;
-  
+
   (* Persistent storage loader *)
-  let _ = initialize_server_state !id in
+  ignore (initialize_server_state !id);
 
   (* Launch three threads *)
   Lwt.async (fun () ->
