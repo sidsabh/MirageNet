@@ -20,7 +20,7 @@ let id = ref 0
 let num_servers = ref 0
 
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
-  Hashtbl.create 10
+  Hashtbl.create 31
 
 (* Persistent state on all servers *)
 let term = ref 0
@@ -48,7 +48,65 @@ let votes_received : int list ref = ref []
 let votes_mutex = Lwt_mutex.create ()
 
 (* Other*)
-let state_map = Hashtbl.create 10
+let state_map = Hashtbl.create 31
+
+
+(* File paths for persistence *)
+let state_file_path server_id =
+  Printf.sprintf "data/raft_server_%d_state.dat" server_id
+
+(* State type for persistence *)
+type persistent_state = {
+  term : int;
+  voted_for : int;
+  log : Raftkv.LogEntry.t list;
+  prev_log_index : int;
+}
+
+(* Save state to disk *)
+let save_state server_id =
+  let state = {
+    term = !term;
+    voted_for = !voted_for;
+    log = !log;
+    prev_log_index = !prev_log_index;
+  } in
+  Lwt_mutex.with_lock log_mutex (fun () ->
+      let file_path = state_file_path server_id in
+      Lwt_io.with_file ~mode:Lwt_io.Output file_path (fun channel ->
+          let data = Marshal.to_bytes state [] in
+          Lwt_io.write_from_string_exactly channel
+            (Bytes.unsafe_to_string data) 0 (Bytes.length data)
+        )
+    )
+
+(* Load state from disk *)
+let load_state server_id =
+  let file_path = state_file_path server_id in
+  if Sys.file_exists file_path then
+    Lwt_io.with_file ~mode:Lwt_io.Input file_path (fun channel ->
+        Lwt_io.read channel >>= fun data ->
+        let state =
+          Marshal.from_bytes (Bytes.of_string data) 0
+        in
+        Lwt_mutex.with_lock log_mutex (fun () ->
+            term := state.term;
+            voted_for := state.voted_for;
+            log := state.log;
+            prev_log_index := state.prev_log_index;
+            Lwt.return_unit
+          )
+      )
+  else
+    Lwt.return_unit
+
+let initialize_server_state server_id =
+  load_state server_id >>= fun () ->
+  Lwt.finalize
+    (fun () ->
+       (* Perform server initialization logic here *)
+       Lwt.return_unit)
+    (fun () -> save_state server_id)
 
 (* Handle GetState *)
 let handle_get_state_request buffer =
@@ -617,42 +675,6 @@ let send_heartbeats () =
           Lwt.return ())
     all_server_ids
 
-(* Raftkv.FrontEnd.newLeader *)
-(* TODO: Is this necessary? *)
-let call_new_leader () =
-  let* addresses =
-    Lwt_unix.getaddrinfo "localhost" (string_of_int 8001)
-      [ Unix.(AI_FAMILY PF_INET) ]
-  in
-  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-  let error_handler _ = print_endline "error" in
-  let* connection =
-    H2_lwt_unix.Client.create_connection ~error_handler socket
-  in
-
-  let encode, decode =
-    Service.make_client_functions Raftkv.FrontEnd.newLeader
-  in
-  let req = Raftkv.IntegerArg.make ~arg:!id () in
-  let enc = encode req |> Writer.contents in
-
-  Client.call ~service:"raftkv.FrontEnd" ~rpc:"NewLeader"
-    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
-    ~handler:
-      (Client.Rpc.unary enc ~f:(fun decoder ->
-           let+ decoder = decoder in
-           match decoder with
-           | Some decoder -> (
-               Reader.create decoder |> decode |> function
-               | Ok v -> v
-               | Error e ->
-                   failwith
-                     (Printf.sprintf "Could not decode request: %s"
-                        (Result.show_error e)))
-           | None -> Raftkv.FrontEnd.NewLeader.Response.make ()))
-    ()
-
 let rec heartbeat_loop () =
   Lwt_unix.sleep heartbeat_timeout >>= fun () ->
   (* Send heartbeat to all servers *)
@@ -678,8 +700,6 @@ let count_votes num_votes_received =
     match_index := List.init !num_servers (fun _ -> -1);
 
     role := "leader";
-    (* Tell frontend we are the new leader *)
-    ignore (call_new_leader ());
 
     (* Send heartbeats for TODO: when does this stop?? *)
     Lwt.async (fun () -> heartbeat_loop ()))
@@ -850,6 +870,9 @@ let () =
   Random.self_init ();
   Random.init ((Unix.time () |> int_of_float) + !id);
   setup_signal_handler server_connections;
+  
+  (* Persistent storage loader *)
+  let _ = initialize_server_state !id in
 
   (* Launch three threads *)
   Lwt.async (fun () ->

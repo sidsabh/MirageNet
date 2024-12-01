@@ -3,3 +3,4 @@ bin/*
 raft.log
 strace_*
 **CS380D-RaftProject
+data/*

@@ -10,7 +10,7 @@ open Common
 let num_servers = ref 0
 
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
-  Hashtbl.create 10
+  Hashtbl.create 31
 
 let leader_id = ref 1
 
@@ -51,7 +51,7 @@ let call_server_rpc ~(server_id : int) ~(rpc_name : string) ~service ~request =
                Grpc.Status.Invalid_argument),
           Grpc.Status.v ~message:"OK" Grpc.Status.OK )
 
-(* Adjusted send_request_to_leader function *)
+(* Generic Leader Request *)
 let send_request_to_leader ~(rpc_name : string) ~service ~request
     ~extract_leader_info =
   let rec loop () =
@@ -151,7 +151,7 @@ let spawn_server i =
   let command =
     Printf.sprintf
       "./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; \
-       fflush()}' >> raft.log &"
+       fflush()}' >> ./data/raft.log &"
       i !num_servers name i
   in
   ignore (Sys.command command)
@@ -203,17 +203,6 @@ let handle_start_raft_request buffer =
   in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
-(* Handle New Leader *)
-let handle_new_leader_request buffer =
-  let decode, encode =
-    Service.make_service_functions Raftkv.FrontEnd.newLeader
-  in
-  let request = read_request buffer decode "NewLeader" in
-  leader_id := request;
-
-  let reply = Raftkv.FrontEnd.NewLeader.Response.make () in
-  Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-
 (* Create FrontEnd service with all RPCs *)
 let frontend_service =
   Server.Service.(
@@ -222,7 +211,6 @@ let frontend_service =
     |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
     |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
     |> add_rpc ~name:"StartRaft" ~rpc:(Unary handle_start_raft_request)
-    |> add_rpc ~name:"NewLeader" ~rpc:(Unary handle_new_leader_request)
     |> handle_request)
 
 let grpc_routes =
