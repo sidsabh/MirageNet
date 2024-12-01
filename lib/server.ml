@@ -168,7 +168,8 @@ let handle_request_vote buffer =
           (true, max req_term !term))
       in
 
-      Printf.printf "vote_granted to %d from me %d? %b my_term %d his term %d\n" req_candidate_id !id vote_granted !term req_term;
+      Printf.printf "vote_granted to %d from me %d? %b my_term %d his term %d\n"
+        req_candidate_id !id vote_granted !term req_term;
 
       (* Create the response based on our decision *)
       let reply =
@@ -665,8 +666,8 @@ let count_votes num_votes_received =
   let majority = (total_servers / 2) + 1 in
   if num_votes_received >= majority then (
     (* If we've received a majority, we win the election *)
-    Printf.printf "We have a majority of votes (%d/%d) at term %d.\n" num_votes_received
-      total_servers !term;
+    Printf.printf "We have a majority of votes (%d/%d) at term %d.\n"
+      num_votes_received total_servers !term;
     leader_id := !id;
     prev_log_index := List.length !log - 1;
     let _ =
