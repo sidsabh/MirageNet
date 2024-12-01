@@ -12,27 +12,27 @@ type append_entry_state = {
 let create_append_entry_state () =
   { successful_replies = 0; majority_condition = Lwt_condition.create () }
 
-(* Global Vars *)
+(* Global state *)
 let id = ref 0
 let num_servers = ref 0
 let role = ref "follower"
 let term = ref 0
 let voted_for = ref 0
 let votes_received : int list ref = ref []
-let commit_index = ref 0
-let last_applied = ref 0
+let commit_index = ref (-1)
+let last_applied = ref (-1)
 let log : Raftkv.LogEntry.t list ref = ref []
-let prev_log_index = ref 0
+let prev_log_index = ref (-1)
 let state = Hashtbl.create 10
 let messages_recieved = ref false
 let leader_id = ref 0
 let next_index = ref []
-let last_batch = ref 0
+let last_batch = ref (-1)
 let match_index = ref []
 let log_mutex = Mutex.create () (* Mutex to protect the log *)
 let next_index_mutex = Mutex.create () (* Mutex to protect the next_index *)
 
-(* Global map to store active connections to each server *)
+(* Global map to store active connections to each server - initialized to approx size (number of servers - 1) *)
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
   Hashtbl.create 10
 
@@ -67,8 +67,9 @@ let handle_get_request buffer =
       Printf.printf "Received Get request for key: %s\n" v.key;
       flush stdout;
       let value =
-        try Hashtbl.find state v.key
-        (* with Not_found -> failwith "Key not found" *)
+        try
+          Hashtbl.find state v.key
+          (* with Not_found -> failwith "Key not found" *)
         with Not_found -> "Key not found"
       in
       let reply =
@@ -417,7 +418,7 @@ let rec send_entries idx state new_commit_index =
   let new_entries = List.filter verify_index !log in
   Lwt.async (fun () ->
       let port = 9000 + idx + 1 in
-      call_append_entries port prev_log_index new_entries >>= fun res ->
+      let* res = call_append_entries port prev_log_index new_entries in
       match res with
       | Ok (v, _) ->
           let _res_term = v.term in
@@ -604,7 +605,7 @@ let send_heartbeats () =
             (* Printf.printf "Leader: Sending heartbeat with prev_log_index: %d\n" !prev_log_index;
                flush stdout; *)
             let prev_log_index = List.nth !next_index (server_id - 1) - 1 in
-            call_append_entries port prev_log_index [] >>= fun res ->
+            let* res = call_append_entries port prev_log_index [] in
             match res with
             | Ok (_, _) ->
                 (* if not res.success then
@@ -629,14 +630,17 @@ let rec heartbeat_loop () =
 
 let call_new_leader () =
   (* Setup Http/2 connection *)
-  Lwt_unix.getaddrinfo "localhost" (string_of_int 8001)
-    [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
+  let* addresses =
+    Lwt_unix.getaddrinfo "localhost" (string_of_int 8001)
+      [ Unix.(AI_FAMILY PF_INET) ]
+  in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
+  let* connection =
+    H2_lwt_unix.Client.create_connection ~error_handler socket
+  in
+
   (* Continue with the rest of your code using `connection` *)
 
   (* code generation *)
@@ -682,7 +686,7 @@ let count_votes () =
 
     role := "leader";
     (* Tell frontend we are the new leader *)
-    ignore (call_new_leader ()); 
+    ignore (call_new_leader ());
     Lwt.async (fun () -> heartbeat_loop ()))
   else
     (* Otherwise, we need to continue gathering votes *)
@@ -705,9 +709,10 @@ let send_request_vote_rpcs () =
             let last_log_term =
               if log_length = 0 then 0 else (List.nth !log last_log_index).term
             in
-            call_request_vote port candidate_id term last_log_index
-              last_log_term
-            >>= fun res ->
+            let* res =
+              call_request_vote port candidate_id term last_log_index
+                last_log_term
+            in
             match res with
             | Ok (res, _) ->
                 (* Printf.printf "RequestVote RPC to server %d successful\n" server_id; *)
@@ -767,7 +772,7 @@ let key_value_store_service =
     |> add_rpc ~name:"AppendEntries" ~rpc:(Unary handle_append_entries)
     |> handle_request)
 
-let server =
+let grpc_routes =
   Server.(
     v ()
     |> add_service ~name:"raftkv.KeyValueStore" ~service:key_value_store_service)
@@ -775,21 +780,24 @@ let server =
 (* Function to create a connection to another server *)
 let create_connection address port =
   (* Retrieve the address information for the server *)
-  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
+  let* addresses =
+    Lwt_unix.getaddrinfo address (string_of_int port)
+      [ Unix.(AI_FAMILY PF_INET) ]
+  in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.setsockopt socket Unix.SO_REUSEPORT true;
 
-  (* Set up a bind if necessary, as per your previous code *)
   let src_port = 7001 + (!num_servers * (!id - 1)) + (port - 9001) in
   let bind_address = Unix.ADDR_INET (Unix.inet_addr_loopback, src_port) in
+  (* Setup socket*)
   Lwt_unix.bind socket bind_address >>= fun () ->
-  (* Connect to the server *)
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-  (* Create the connection *)
   let error_handler _ = print_endline "error" in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
+
+  (* Launch *)
+  let* connection =
+    H2_lwt_unix.Client.create_connection ~error_handler socket
+  in
   (* Store the connection in the global map *)
   Hashtbl.add server_connections port connection;
 
@@ -797,9 +805,8 @@ let create_connection address port =
 
 (* Function to establish connections to all other servers *)
 let establish_connections () =
-  (* Wait for 500 ms to give time for the other servers to spawn *)
-  Lwt_unix.sleep 0.1 >>= fun () ->
-  (* Loop through all server ports and establish connections to each one *)
+  (* Wait for a half a sec for the other servers to spawn *)
+  Lwt_unix.sleep 0.5 >>= fun () ->
   let rec establish_for_ports ports =
     match ports with
     | [] -> Lwt.return ()
@@ -808,70 +815,78 @@ let establish_connections () =
         establish_for_ports rest
   in
 
-  (* Generate the list of ports for other servers *)
   let ports_to_connect =
     List.init !num_servers (fun i -> 9001 + i)
     |> List.filter (fun p -> p <> !id + 9000)
   in
 
-  (* Establish connections to the other servers *)
   establish_for_ports ports_to_connect
 
-let () =
-  id := int_of_string Sys.argv.(1);
-  num_servers := int_of_string Sys.argv.(2);
-
-  (* Seed the random number generator *)
-  Random.self_init ();
-  Random.init ((Unix.time () |> int_of_float) + !id);
-
+let start_server () =
   let port = 9000 + !id in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
   let server_name = Printf.sprintf "raftserver%d" !id in
+  try
+    let server =
+      H2_lwt_unix.Server.create_connection_handler ?config:None
+        ~request_handler:(fun _ reqd -> Server.handle_request grpc_routes reqd)
+        ~error_handler:(fun _ ?request:_ _ _ ->
+          print_endline "an error occurred")
+    in
+    let+ _server =
+      Lwt_io.establish_server_with_client_socket listen_address server
+    in
+    Printf.printf "Server %s listening on port %i for grpc requests\n"
+      server_name port;
+    flush stdout
+  with
+  | Unix.Unix_error (err, func, arg) ->
+      (* Handle Unix system errors *)
+      Printf.eprintf "Unix error: %s in function %s with argument %s\n"
+        (Unix.error_message err) func arg;
+      Lwt.return ()
+  | exn ->
+      (* Other error cases *)
+      Printf.eprintf "Error: %s\n" (Printexc.to_string exn);
+      Lwt.return ()
 
-  (* Start the server *)
+(* Function to gracefully close all sockets *)
+let close_all_sockets () =
+  Printf.printf "Received SIGTERM, shutting down, closing all sockets\n";
+  flush stdout;
+  Hashtbl.fold
+    (fun _ connection acc ->
+      Lwt.finalize
+        (fun () -> H2_lwt_unix.Client.shutdown connection)
+        (fun () -> acc))
+    server_connections (Lwt.return ())
+
+(* Signal handler for SIGTERM *)
+let setup_signal_handler () =
+  let handle_signal _ =
+    let* () = close_all_sockets () in
+    Lwt.return (exit 0)
+  in
+  let _ = Lwt_unix.on_signal Sys.sigterm (fun _ -> Lwt.async handle_signal) in
+  ()
+
+let () =
+  (* Argv *)
+  id := int_of_string Sys.argv.(1);
+  num_servers := int_of_string Sys.argv.(2);
+
+  (* Setup *)
+  Random.self_init ();
+  Random.init ((Unix.time () |> int_of_float) + !id);
+  setup_signal_handler ();
+
+  (* Launch *)
   Lwt.async (fun () ->
-      try
-        let server =
-          H2_lwt_unix.Server.create_connection_handler ?config:None
-            ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
-            ~error_handler:(fun _ ?request:_ _ _ ->
-              print_endline "an error occurred")
-        in
-        let+ _server =
-          Lwt_io.establish_server_with_client_socket listen_address server
-        in
-        Printf.printf "Server %s listening on port %i for grpc requests\n"
-          server_name port;
-        flush stdout
-        (* Return unit Lwt.t *)
-      with
-      | Unix.Unix_error (err, func, arg) ->
-          (* Handle Unix system errors *)
-          Printf.eprintf "Unix error: %s in function %s with argument %s\n"
-            (Unix.error_message err) func arg;
-          Lwt.return () (* Return unit Lwt.t for error cases *)
-      | exn ->
-          (* Handle other exceptions *)
-          Printf.eprintf "Error: %s\n" (Printexc.to_string exn);
-          Lwt.return ());
+      let* () = start_server () in
+      let* () = establish_connections () in
+      Lwt.join [ election_loop (); batch_loop () ]
+      (* Concurrent *));
 
-  (* Return unit Lwt.t for error cases *)
-
-  (* Initialize as follower *)
-  Lwt.async establish_connections;
-  role := "follower";
-  commit_index := -1;
-  last_applied := -1;
-  prev_log_index := -1;
-  last_batch := -1;
-
-  (* Start election timeout *)
-  Lwt.async election_loop;
-
-  (* Start batch loop *)
-  Lwt.async batch_loop;
-
-  (* Keep the server running *)
+  (* while(1) *)
   let forever, _ = Lwt.wait () in
   Lwt_main.run forever

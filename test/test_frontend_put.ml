@@ -4,16 +4,17 @@ open Grpc_lwt
 
 let call_put address port =
   (* Setup Http/2 connection *)
-  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
+  let* addresses =
+    Lwt_unix.getaddrinfo address (string_of_int port)
+      [ Unix.(AI_FAMILY PF_INET) ]
+  in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
-  (* Continue with the rest of your code using `connection` *)
+  let* connection =
+    H2_lwt_unix.Client.create_connection ~error_handler socket
+  in
 
-  (* code generation *)
   let open Ocaml_protoc_plugin in
   let open Raftkv in
   let encode, decode = Service.make_client_functions Raftkv.FrontEnd.put in

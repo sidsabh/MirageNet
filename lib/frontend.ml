@@ -10,19 +10,22 @@ let num_servers = ref 0
 let leader_id = ref 1
 
 (* Disable SIGPIPE in case server down *)
-let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore 
+let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
 
 (* Call Server Get *)
 let call_server_get address server_id key client_id request_id =
   (* Setup Http/2 connection for RequestVote RPC *)
   let port = 9000 + server_id in
-  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
+  let* addresses =
+    Lwt_unix.getaddrinfo address (string_of_int port)
+      [ Unix.(AI_FAMILY PF_INET) ]
+  in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
+  let* connection =
+    H2_lwt_unix.Client.create_connection ~error_handler socket
+  in
   (* code generation for RequestVote RPC *)
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.get in
   let req =
@@ -49,10 +52,10 @@ let call_server_get address server_id key client_id request_id =
 let send_get_request_to_leader address key clientId requestId =
   (*  *)
   let rec loop () =
-    call_server_get address !leader_id key clientId requestId >>= fun res ->
+    let* res = call_server_get address !leader_id key clientId requestId in
     match res with
     | Ok (res, _) ->
-  (* Spec: frontend may have to query the servers to find out who the current leader is *)
+        (* Spec: frontend may have to query the servers to find out who the current leader is *)
         let wrong_leader = res.wrongLeader in
         let _error = res.error in
         let value = res.value in
@@ -109,8 +112,8 @@ let handle_get_request buffer =
 
   (* Reply to the client *)
   let reply =
-    Raftkv.FrontEnd.Get.Response.make ~wrongLeader:res_wrong_leader ~error:res_error
-      ~value:res_value ()
+    Raftkv.FrontEnd.Get.Response.make ~wrongLeader:res_wrong_leader
+      ~error:res_error ~value:res_value ()
   in
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
@@ -118,13 +121,16 @@ let handle_get_request buffer =
 let call_server_put address server_id key value client_id request_id =
   (* Setup Http/2 connection for RequestVote RPC *)
   let port = 9000 + server_id in
-  Lwt_unix.getaddrinfo address (string_of_int port) [ Unix.(AI_FAMILY PF_INET) ]
-  >>= fun addresses ->
+  let* addresses =
+    Lwt_unix.getaddrinfo address (string_of_int port)
+      [ Unix.(AI_FAMILY PF_INET) ]
+  in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
-  H2_lwt_unix.Client.create_connection ~error_handler socket
-  >>= fun connection ->
+  let* connection =
+    H2_lwt_unix.Client.create_connection ~error_handler socket
+  in
   (* code generation for RequestVote RPC *)
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.put in
   let req =
@@ -151,8 +157,9 @@ let call_server_put address server_id key value client_id request_id =
 
 let send_put_request_to_leader address key value clientId requestId =
   let rec loop () =
-    call_server_put address !leader_id key value clientId requestId
-    >>= fun res ->
+    let* res =
+      call_server_put address !leader_id key value clientId requestId
+    in
     match res with
     | Ok (res, _) ->
         let wrong_leader = res.wrongLeader in
@@ -250,7 +257,9 @@ let spawn_server i =
 
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
-  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.startRaft in
+  let decode, encode =
+    Service.make_service_functions Raftkv.FrontEnd.startRaft
+  in
   let request =
     Reader.create buffer |> decode |> function
     | Ok v ->
@@ -274,7 +283,9 @@ let handle_start_raft_request buffer =
 
 (* Handle New Leader *)
 let handle_new_leader_request buffer =
-  let decode, encode = Service.make_service_functions Raftkv.FrontEnd.newLeader in
+  let decode, encode =
+    Service.make_service_functions Raftkv.FrontEnd.newLeader
+  in
   let request =
     Reader.create buffer |> decode |> function
     | Ok v ->
