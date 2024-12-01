@@ -1,3 +1,16 @@
+(library
+ (name common)
+ (modules common)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  raftkv
+  h2
+  h2-lwt-unix))
+
 (executable
  (name frontend)
  (modules frontend)
@@ -10,7 +23,8 @@
   lwt.unix
   raftkv
   h2
-  h2-lwt-unix))
+  h2-lwt-unix
+  common))
 
 (executable
  (name server)
@@ -24,4 +38,5 @@
   lwt.unix
   raftkv
   h2
-  h2-lwt-unix))
+  h2-lwt-unix
+  common))

@@ -4,28 +4,22 @@ open Lwt.Infix
 open Lwt.Syntax
 open Raftkv
 open Ocaml_protoc_plugin
+open Common
 
 (* Global state *)
 let num_servers = ref 0
+let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
+  Hashtbl.create 10
 let leader_id = ref 1
 
 (* Disable SIGPIPE in case server down *)
 let () = Sys.set_signal Sys.sigpipe Sys.Signal_ignore
 
 (* Call Server Get *)
-let call_server_get address server_id key client_id request_id =
+let call_server_get server_id key client_id request_id =
   (* Setup Http/2 connection for RequestVote RPC *)
   let port = 9000 + server_id in
-  let* addresses =
-    Lwt_unix.getaddrinfo address (string_of_int port)
-      [ Unix.(AI_FAMILY PF_INET) ]
-  in
-  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-  let error_handler _ = print_endline "error" in
-  let* connection =
-    H2_lwt_unix.Client.create_connection ~error_handler socket
-  in
+  let connection = Hashtbl.find server_connections port in
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.get in
   let req =
     Raftkv.GetKey.make ~key ~clientId:client_id ~requestId:request_id ()
@@ -48,10 +42,10 @@ let call_server_get address server_id key client_id request_id =
            | None -> Raftkv.KeyValueStore.Get.Response.make ()))
     ()
 
-let send_get_request_to_leader address key clientId requestId =
+let send_get_request_to_leader key clientId requestId =
   (*  *)
   let rec loop () =
-    let* res = call_server_get address !leader_id key clientId requestId in
+    let* res = call_server_get !leader_id key clientId requestId in
     match res with
     | Ok (res, _) ->
         (* Spec: frontend may have to query the servers to find out who the current leader is *)
@@ -102,7 +96,7 @@ let handle_get_request buffer =
 
   (* Find the leader *)
   let* res =
-    send_get_request_to_leader "localhost" request.key request.clientId
+    send_get_request_to_leader request.key request.clientId
       request.requestId
   in
   let res_wrong_leader = res.wrongLeader in
@@ -117,19 +111,10 @@ let handle_get_request buffer =
   Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
 (* Call server put *)
-let call_server_put address server_id key value client_id request_id =
+let call_server_put server_id key value client_id request_id =
   (* Setup Http/2 connection for RequestVote RPC *)
   let port = 9000 + server_id in
-  let* addresses =
-    Lwt_unix.getaddrinfo address (string_of_int port)
-      [ Unix.(AI_FAMILY PF_INET) ]
-  in
-  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-  let error_handler _ = print_endline "error" in
-  let* connection =
-    H2_lwt_unix.Client.create_connection ~error_handler socket
-  in
+  let connection = Hashtbl.find server_connections port in
   (* code generation for RequestVote RPC *)
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.put in
   let req =
@@ -154,10 +139,10 @@ let call_server_put address server_id key value client_id request_id =
            | None -> Raftkv.KeyValueStore.Put.Response.make ()))
     ()
 
-let send_put_request_to_leader address key value clientId requestId =
+let send_put_request_to_leader key value clientId requestId =
   let rec loop () =
     let* res =
-      call_server_put address !leader_id key value clientId requestId
+      call_server_put !leader_id key value clientId requestId
     in
     match res with
     | Ok (res, _) ->
@@ -207,7 +192,7 @@ let handle_put_request buffer =
 
       (* Find the leader *)
       let* res =
-        send_put_request_to_leader "localhost" key value clientId requestId
+        send_put_request_to_leader key value clientId requestId
       in
       let res_wrong_leader = res.wrongLeader in
       let res_error = res.error in
@@ -245,7 +230,6 @@ let handle_replace_request buffer =
 (* spawn server processes *)
 let spawn_server i =
   let name = "raftserver" ^ string_of_int i in
-  (* TODO: Find better way to call *)
   let command =
     Printf.sprintf
       "./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; \
@@ -253,6 +237,20 @@ let spawn_server i =
       i !num_servers name i
   in
   ignore (Sys.command command)
+
+let connect_server i =
+  let port = i + 9000 in
+  let* addresses =
+    Lwt_unix.getaddrinfo  "localhost" (string_of_int port)
+      [ Unix.(AI_FAMILY PF_INET) ]
+  in
+  let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
+  let error_handler _ = print_endline "error" in
+  let* connection =
+    H2_lwt_unix.Client.create_connection ~error_handler socket in
+  Hashtbl.add server_connections port connection;
+  Lwt.return ()
 
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
@@ -272,7 +270,8 @@ let handle_start_raft_request buffer =
   in
   num_servers := request;
   for i = 1 to request do
-    ignore (spawn_server i)
+    ignore (spawn_server i);
+    ignore (connect_server i);
   done;
 
   let reply =
@@ -319,6 +318,8 @@ let grpc_routes =
 let () =
   let port = 8001 in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+  
+  setup_signal_handler server_connections;
 
   (* Server that responds to RPC (listens on 8001)*)
   Lwt.async (fun () ->

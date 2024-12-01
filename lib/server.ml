@@ -4,6 +4,7 @@ open Raftkv
 open Ocaml_protoc_plugin
 open Lwt.Syntax
 open Lwt.Infix
+open Common
 
 type append_entry_state = {
   mutable successful_replies : int;
@@ -105,7 +106,7 @@ let handle_replace_request buffer =
   | Ok v ->
       Printf.printf "Received Replace request with key: %s and value: %s\n"
         v.key v.value;
-         (* TODO: more to do here? *)
+      (* TODO: more to do here? *)
       let reply =
         Raftkv.KeyValueStore.Replace.Response.make ~wrongLeader:false ~error:""
           ()
@@ -410,7 +411,7 @@ let rec send_entries follower_idx state new_commit_index =
           let _res_term = v.term in
           let res_success = v.success in
           (if res_success then (
-            (* Fully updated nodes succeed*)
+             (* Fully updated nodes succeed*)
              state.successful_replies <- state.successful_replies + 1;
              Printf.printf
                "AppendEntries RPC to server %d successful, replies: %d\n"
@@ -419,7 +420,8 @@ let rec send_entries follower_idx state new_commit_index =
              Mutex.lock next_index_mutex;
              next_index :=
                List.mapi
-                 (fun i x -> if i = follower_idx then new_commit_index + 1 else x)
+                 (fun i x ->
+                   if i = follower_idx then new_commit_index + 1 else x)
                  !next_index;
              match_index :=
                List.mapi
@@ -450,12 +452,15 @@ let rec send_entries follower_idx state new_commit_index =
              else (
                Mutex.lock next_index_mutex;
                next_index :=
-                 List.mapi (fun i x -> if i = follower_idx then x - 1 else x) !next_index;
+                 List.mapi
+                   (fun i x -> if i = follower_idx then x - 1 else x)
+                   !next_index;
                Mutex.unlock next_index_mutex;
                Printf.printf
                  "AppendEntries RPC to server %d failed, trying again with \
                   nextIndex: %d\n"
-                 (follower_idx + 1) (List.nth !next_index follower_idx);
+                 (follower_idx + 1)
+                 (List.nth !next_index follower_idx);
                flush stdout;
                send_entries follower_idx state new_commit_index));
           Lwt.return ()
@@ -549,7 +554,8 @@ let handle_put_request buffer =
         flush stdout;
         let* _ = append_entry req_key req_value in
         let reply =
-          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:"" ~value:"Success" ()
+          Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:""
+            ~value:"Success" ()
         in
         Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
   | Error e ->
@@ -832,26 +838,6 @@ let start_server () =
       Printf.eprintf "Error: %s\n" (Printexc.to_string exn);
       Lwt.return ()
 
-(* Function to gracefully close all sockets *)
-let close_all_sockets () =
-  Printf.printf "Received SIGTERM, shutting down, closing all sockets\n";
-  flush stdout;
-  Hashtbl.fold
-    (fun _ connection acc ->
-      Lwt.finalize
-        (fun () -> H2_lwt_unix.Client.shutdown connection)
-        (fun () -> acc))
-    server_connections (Lwt.return ())
-
-(* Signal handler for SIGTERM *)
-let setup_signal_handler () =
-  let handle_signal _ =
-    let* () = close_all_sockets () in
-    Lwt.return (exit 0)
-  in
-  let _ = Lwt_unix.on_signal Sys.sigterm (fun _ -> Lwt.async handle_signal) in
-  ()
-
 (* Main *)
 let () =
   (* Argv *)
@@ -861,7 +847,7 @@ let () =
   (* Setup *)
   Random.self_init ();
   Random.init ((Unix.time () |> int_of_float) + !id);
-  setup_signal_handler ();
+  setup_signal_handler server_connections;
 
   (* Launch three threads *)
   Lwt.async (fun () ->
