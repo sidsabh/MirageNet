@@ -271,8 +271,13 @@ let handle_start_raft_request buffer =
   num_servers := request;
   for i = 1 to request do
     ignore (spawn_server i);
+  done;
+  (* Wait for a half a sec for the other servers to spawn *)
+  let* _ = Lwt_unix.sleep 0.5 in
+  for i = 1 to request do
     ignore (connect_server i);
   done;
+
 
   let reply =
     Raftkv.FrontEnd.StartRaft.Response.make ~wrongLeader:false ~error:"" ()

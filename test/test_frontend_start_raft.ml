@@ -3,6 +3,7 @@ open Lwt.Syntax
 open Grpc_lwt
 
 let num_servers = 31
+(* let num_servers = 5 *)
 
 let call_server address port =
   (* Setup Http/2 connection *)

@@ -168,6 +168,8 @@ let handle_request_vote buffer =
           (true, max req_term !term))
       in
 
+      Printf.printf "vote_granted to %d from me %d? %b my_term %d his term %d\n" req_candidate_id !id vote_granted !term req_term;
+
       (* Create the response based on our decision *)
       let reply =
         Raftkv.KeyValueStore.RequestVote.Response.make ~vote_granted
@@ -231,9 +233,8 @@ let handle_append_entries buffer =
           (* Leaders send periodic heartbeats (AppendEntries RPCs that carry no log entries) *)
           req_term > !term || (req_term = !term && req_leader_id <> !leader_id)
         then (
-          (* TODO: confirm this if was incorrect*)
-          if !role = "leader" then
-            failwith "Multiple leaders in the same term, aborting";
+          if !role = "leader" && !term = req_term then
+            failwith "Multiple leaders in the same term, SYSERROR";
 
           (* New leader *)
           term := req_term;
@@ -388,7 +389,7 @@ let call_append_entries port prev_log_index entries =
            match decoder with
            | Some decoder -> (
                Reader.create decoder |> decode |> function
-               | Ok v -> v (* TODO: more to do here? *)
+               | Ok v -> v
                | Error e ->
                    failwith
                      (Printf.sprintf "Could not decode request: %s"
@@ -664,8 +665,8 @@ let count_votes num_votes_received =
   let majority = (total_servers / 2) + 1 in
   if num_votes_received >= majority then (
     (* If we've received a majority, we win the election *)
-    Printf.printf "We have a majority of votes (%d/%d).\n" num_votes_received
-      total_servers;
+    Printf.printf "We have a majority of votes (%d/%d) at term %d.\n" num_votes_received
+      total_servers !term;
     leader_id := !id;
     prev_log_index := List.length !log - 1;
     let _ =
@@ -740,7 +741,7 @@ let rec election_loop () =
     voted_for := !id;
     votes_received := [ !id ];
     (* Restart the election timeout and send RequestVote RPCs *)
-    Lwt.async (fun () -> send_request_vote_rpcs ());
+    send_request_vote_rpcs () >>= fun () ->
     election_loop () (* Continue the loop *))
   else (
     (* Reset message received flag and restart the loop *)
@@ -854,9 +855,8 @@ let () =
       let* () = start_server () in
       (* server that responds to RPC (listens on 9xxx)*)
       let* () = establish_connections () in
-      Lwt.join [ election_loop (); batch_loop () ]
-      (* *)
-      (* Concurrent *));
+      (* Concurrently run election and batch loop *)
+      Lwt.join [ election_loop (); batch_loop () ]);
 
   (* while(1) *)
   let forever, _ = Lwt.wait () in
