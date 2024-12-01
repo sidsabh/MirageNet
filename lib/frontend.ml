@@ -26,7 +26,6 @@ let call_server_get address server_id key client_id request_id =
   let* connection =
     H2_lwt_unix.Client.create_connection ~error_handler socket
   in
-  (* code generation for RequestVote RPC *)
   let encode, decode = Service.make_client_functions Raftkv.KeyValueStore.get in
   let req =
     Raftkv.GetKey.make ~key ~clientId:client_id ~requestId:request_id ()
@@ -313,17 +312,20 @@ let frontend_service =
     |> add_rpc ~name:"NewLeader" ~rpc:(Unary handle_new_leader_request)
     |> handle_request)
 
-let server =
+let grpc_routes =
   Server.(v () |> add_service ~name:"raftkv.FrontEnd" ~service:frontend_service)
 
+(* Main *)
 let () =
   let port = 8001 in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
 
+  (* Server that responds to RPC (listens on 8001)*)
   Lwt.async (fun () ->
       let server =
         H2_lwt_unix.Server.create_connection_handler ?config:None
-          ~request_handler:(fun _ reqd -> Server.handle_request server reqd)
+          ~request_handler:(fun _ reqd ->
+            Server.handle_request grpc_routes reqd)
           ~error_handler:(fun _ ?request:_ _ _ ->
             print_endline "an error occurred")
       in
@@ -334,5 +336,6 @@ let () =
         port;
       flush stdout);
 
+  (* while(1) *)
   let forever, _ = Lwt.wait () in
   Lwt_main.run forever
