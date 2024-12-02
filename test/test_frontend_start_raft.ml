@@ -55,5 +55,3 @@ let () =
          else print_endline "Error starting Raft servers";
          print_endline error
      | Error _ -> print_endline "an error occurred")
-
-     

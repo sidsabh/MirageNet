@@ -9,7 +9,6 @@ let log_level = Logs.Debug
 
 (* Function to gracefully close all sockets *)
 let close_all_sockets connections =
-  flush stdout;
   Hashtbl.fold
     (fun _ connection acc ->
       Lwt.finalize

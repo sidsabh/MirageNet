@@ -7,7 +7,7 @@ open Ocaml_protoc_plugin
 open Common
 
 (* Constants*)
-let timeout_duration = 0.15
+let timeout_duration = 0.3
 
 module Log = (val setup_logs "frontend")
 
@@ -176,12 +176,13 @@ let handle_replace_request buffer =
 
 (* spawn server processes *)
 let spawn_server i =
-  let name = "raftserver" ^ string_of_int i in
-  let command =
-    Printf.sprintf "./bin/server %d %d %s >> ./data/raft.log 2>&1 &" i
-      !num_servers name
-  in
-  ignore (Sys.command command)
+  let name = Printf.sprintf "raftserver%d" i in
+
+  match Unix.fork () with
+  | 0 ->
+      Unix.execv "./bin/server"
+        [| name; string_of_int i; string_of_int !num_servers |]
+  | pid -> Log.debug (fun m -> m "Started %s with PID %d" name pid)
 
 let connect_server i =
   let port = i - 1 + Common.start_server_ports in
@@ -265,8 +266,7 @@ let () =
       let+ _server =
         Lwt_io.establish_server_with_client_socket listen_address server
       in
-      Log.info (fun m ->
-          m "Frontend service listening on port %i for grpc requests" port));
+      Log.info (fun m -> m "Listening on port %i for grpc requests" port));
 
   (* while(1) *)
   let forever, _ = Lwt.wait () in

@@ -10,6 +10,8 @@ open Common
 let heartbeat_timeout = 0.1
 let batch_timeout = 0.05
 let rpc_timeout = 0.1
+let election_timeout_floor = 0.3
+let election_timeout_additional = 0.3
 
 (* Config *)
 let id = ref 0
@@ -29,11 +31,33 @@ let voted_for = ref 0
 let log : Raftkv.LogEntry.t list ref = ref []
 let log_mutex = Lwt_mutex.create () (* Mutex to protect the log *)
 let commit_length = ref (-1)
+let kv_store = Hashtbl.create 100  (* Re-constructed *)
 
 (* Volatile state on all servers *)
 let commit_index = ref (-1)
 let last_applied = ref (-1)
-let role = ref "follower"
+(* Define the role type as an enumeration *)
+type role = Leader | Follower | Candidate
+
+(* Atomic variable to store the current role *)
+let role = Atomic.make Follower
+
+(* Helper functions to log and manipulate the role *)
+let get_role () = Atomic.get role
+
+let set_role new_role =
+  Log.info (fun m ->
+      m "Changing role from %s to %s"
+        (match get_role () with
+         | Leader -> "Leader"
+         | Follower -> "Follower"
+         | Candidate -> "Candidate")
+        (match new_role with
+         | Leader -> "Leader"
+         | Follower -> "Follower"
+         | Candidate -> "Candidate"));
+  Atomic.set role new_role
+
 let leader_id = ref 0
 let messages_recieved = ref false
 
@@ -47,9 +71,6 @@ let last_batch = ref (-1)
 (* Volatile state on candidates *)
 let votes_received : int list ref = ref []
 let votes_mutex = Lwt_mutex.create ()
-
-(* Other*)
-let kv_store = Hashtbl.create Common.max_connections
 
 (* File paths for persistence *)
 let state_file_path server_id =
@@ -116,6 +137,16 @@ let initialize_server_state server_id =
       Lwt.return_unit)
     (fun () -> save_state server_id)
 
+let set_follower () =
+  set_role Follower;
+  voted_for := 0;
+  let* _ = Lwt_mutex.with_lock votes_mutex (fun () ->
+    votes_received := [];
+    Lwt.return ()) in
+  messages_recieved := true;
+  Lwt.return ()
+  
+
 let append_entry key value =
   (* add entry to log *)
   let command = key ^ " " ^ value in
@@ -137,7 +168,7 @@ let handle_get_state_request buffer =
   match request with
   | Ok _ ->
       Log.debug (fun m -> m "Received GetState request");
-      let is_leader = !role = "leader" in
+      let is_leader = get_role () = Leader in
       let reply =
         Raftkv.KeyValueStore.GetState.Response.make ~term:!term
           ~isLeader:is_leader ()
@@ -161,7 +192,7 @@ let handle_put_request buffer =
       let req_client_id = v.clientId in
       let req_request_id = v.requestId in
 
-      if !role <> "leader" then
+      if get_role () <> Leader then
         let correct_leader = string_of_int !leader_id in
         let reply =
           Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
@@ -208,7 +239,7 @@ let handle_replace_request buffer =
       let req_client_id = v.clientId in
       let req_request_id = v.requestId in
 
-      if !role <> "leader" then
+      if get_role () <> Leader then
         let correct_leader = string_of_int !leader_id in
         let reply =
           Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
@@ -224,8 +255,7 @@ let handle_replace_request buffer =
               \                \t\"value\": \"%s\"\n\n\
               \                \t\"clientId\": %d\n\n\
               \                \t\"requestId\": %d\n\n\
-              \                }"
-              req_key req_value req_client_id req_request_id);
+              \                }" req_key req_value req_client_id req_request_id);
 
         let value =
           try
@@ -251,7 +281,7 @@ let handle_get_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
-      if !role <> "leader" then
+      if get_role () <> Leader then
         let correct_leader = string_of_int !leader_id in
         let reply =
           Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:true ~error:""
@@ -278,68 +308,77 @@ let handle_get_request buffer =
 (* Handle RequestVoteRPC *)
 let handle_request_vote buffer =
   let decode, encode =
-    Service.make_service_functions Raftkv.KeyValueStore.requestVote
-  in
-  let request = Reader.create buffer |> decode in
-  match request with
-  | Ok v ->
-      let req_candidate_id = v.candidate_id in
-      let req_term = v.term in
-      let req_last_log_index = v.last_log_index in
-      let req_last_log_term = v.last_log_term in
+  Service.make_service_functions Raftkv.KeyValueStore.requestVote
+in
+let request = Reader.create buffer |> decode in
+match request with
+| Ok v ->
+    let req_candidate_id = v.candidate_id in
+    let req_term = v.term in
+    let req_last_log_index = v.last_log_index in
+    let req_last_log_term = v.last_log_term in
 
-      Log.debug (fun m ->
-          m
-            "Received RequestVote request:\n\
-             {\n\
-             \t\"candidate_id\": %d\n\
-             \t\"term\": %d\n\
-             \t\"last_log_index\": %d\n\
-             \t\"last_log_term\": %d\n\
-             }"
-            req_candidate_id req_term req_last_log_index req_last_log_term);
+    Log.debug (fun m ->
+        m
+          "Received RequestVote request:\n\
+           {\n\
+           \t\"candidate_id\": %d\n\
+           \t\"term\": %d\n\
+           \t\"last_log_index\": %d\n\
+           \t\"last_log_term\": %d\n\
+           }"
+          req_candidate_id req_term req_last_log_index req_last_log_term);
 
-      let log_length = List.length !log in
-      let last_log_term =
-        if log_length = 0 then 0 else (List.nth !log (log_length - 1)).term
-      in
-      let log_is_up_to_date =
-        req_last_log_term > last_log_term
-        || req_last_log_term = last_log_term
-           && req_last_log_index >= log_length - 1
-      in
 
-      (* Decide to vote or not *)
-      let vote_granted, updated_term =
-        if
-          req_term < !term
-          || (!voted_for <> 0 && !voted_for <> req_candidate_id)
-          || not log_is_up_to_date
-        then
-          (* If the candidate's term is less than ours, we reject the vote *)
-          (false, !term)
-        else (
-          (* If we haven't voted yet or have voted for this candidate and their log is up-to-date, we vote for them *)
-          voted_for := req_candidate_id;
-          messages_recieved := true;
-          (* Added *)
-          (true, max req_term !term))
-      in
+          (*
+          Receiver implementation: 1. Reply false if term < currentTerm (§5.1) 
+            2. If votedFor is null or candidateId, 
+          and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)*)
+        (* let* () =
+          if req_term > !term then (
+            term := req_term;
+            set_follower ()
+          ) else
+            Lwt.return_unit
+        in *)
 
-      Log.debug (fun m ->
-          m "vote_granted to %d from me %d: %b;; my_term %d;; their term %d"
-            req_candidate_id !id vote_granted !term req_term);
+    let log_length = List.length !log in
+    let last_log_term =
+      if log_length = 0 then 0 else (List.nth !log (log_length - 1)).term
+    in
+    let log_is_up_to_date =
+      req_last_log_term > last_log_term
+      || (req_last_log_term = last_log_term
+          && req_last_log_index >= log_length - 1)
+    in
 
-      (* Create the response based on our decision *)
-      let reply =
-        Raftkv.KeyValueStore.RequestVote.Response.make ~vote_granted
-          ~term:updated_term ()
-      in
-      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
-  | Error e ->
-      failwith
-        (Printf.sprintf "Error decoding RequestVote request: %s"
-           (Result.show_error e))
+    let vote_granted =
+      if req_term < !term then
+        false
+      else if (!voted_for <> 0 && !voted_for <> req_candidate_id) then
+        false
+      else if not log_is_up_to_date then
+        false
+      else (
+        voted_for := req_candidate_id;
+        messages_recieved := true;
+        true
+      )
+    in
+
+    Log.debug (fun m ->
+        m "Vote granted to %d from %d: %b; my_term %d; their_term %d"
+          req_candidate_id !id vote_granted !term req_term);
+
+    let reply =
+      Raftkv.KeyValueStore.RequestVote.Response.make ~vote_granted
+        ~term:!term ()
+    in
+    Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+| Error e ->
+    failwith
+      (Printf.sprintf "Error decoding RequestVote request: %s"
+         (Result.show_error e))
 
 (* Handle AppendEntriesRPC *)
 let handle_append_entries buffer =
@@ -379,13 +418,13 @@ let handle_append_entries buffer =
           (* Leaders send periodic heartbeats (AppendEntries RPCs that carry no log entries) *)
           req_term > !term || (req_term = !term && req_leader_id <> !leader_id)
         then (
-          if !role = "leader" && !term = req_term then
+          if get_role () = Leader && !term = req_term then
             failwith "Multiple leaders in the same term, SYSERROR";
 
           (* New leader *)
           term := req_term;
           leader_id := req_leader_id;
-          role := "follower";
+          set_role Follower;
           messages_recieved := true;
           voted_for := 0;
           let _ =
@@ -483,9 +522,9 @@ let handle_append_entries buffer =
              drop (new_log_length - (req_commit_length + 1)) req_entries
            in
            log := List.concat [ !log; new_entries ];
-           Log.debug (fun m ->
+           (* Log.debug (fun m ->
                m "New log after appending entries: %s"
-                 (String.concat ", " (List.map log_entry_to_string !log)));
+                 (String.concat ", " (List.map log_entry_to_string !log))); *)
            Log.debug (fun m -> m "New log length: %d" (List.length !log))));
 
       (* Condition 5: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) *)
@@ -569,22 +608,14 @@ let call_append_entries port commit_length entries =
         (Stdlib.Error
            (Grpc.Status.v ~message:"RPC failed" Grpc.Status.Deadline_exceeded)))
 
-let set_follower () =
-  role := "follower";
-  voted_for := 0;
-  votes_received := [];
-  messages_recieved := true;
-  ()
-
 (* Function to handle higher term logic *)
 let handle_higher_term new_term =
   if new_term > !term then (
     Log.debug (fun m ->
-        m "Found higher term %d (current: %d). Resetting to follower."
-          new_term !term);
+        m "Found higher term %d (current: %d). Resetting to follower." new_term
+          !term);
     term := new_term;
-    set_follower ();
-    Lwt.return_false (* Indicate that further processing should stop *))
+    set_follower () >>= fun () -> Lwt.return_false)
   else Lwt.return_true (* Continue processing if no higher term *)
 
 type append_entry_state = {
@@ -658,18 +689,21 @@ let rec send_entries follower_idx state new_commit_index =
           Lwt.return ()
       | Error _ -> Lwt.return ())
 
+let all_server_ids () =
+  List.init !num_servers (fun i -> i + 1)
+  |> List.filter (fun server_id -> server_id <> !id)
+
 let rec batch_loop () =
   Lwt_unix.sleep batch_timeout >>= fun () ->
   let* () =
-    if !role = "leader" then
+    if get_role () = Leader then
       let* new_commit_index =
         Lwt_mutex.with_lock log_mutex (fun () ->
             Lwt.return (List.length !log - 1))
       in
       if !last_batch < new_commit_index then (
         Log.debug (fun m ->
-            m "Batch loop detected %d new entries"
-              (new_commit_index - !last_batch));
+            m "Batch loop detected %d..%d" !last_batch new_commit_index );
 
         (* Condition to wait for majority to commit *)
         let state =
@@ -680,15 +714,11 @@ let rec batch_loop () =
         in
 
         (* Send out append entries *)
-        let all_server_ids =
-          List.init !num_servers (fun i -> i + 1)
-          |> List.filter (fun server_id -> server_id <> !id)
-        in
         List.iter
           (fun server_id ->
             let follower_idx = server_id - 1 in
             send_entries follower_idx state new_commit_index)
-          all_server_ids;
+          (all_server_ids ());
 
         last_batch := new_commit_index;
         let* () = Lwt_condition.wait state.majority_condition in
@@ -702,10 +732,6 @@ let rec batch_loop () =
   batch_loop ()
 
 let send_heartbeats () =
-  let all_server_ids =
-    List.init !num_servers (fun i -> i + 1)
-    |> List.filter (fun server_id -> server_id <> !id)
-  in
   Lwt_list.iter_p
     (fun server_id ->
       let port = server_id - 1 + Common.start_server_ports in
@@ -718,7 +744,7 @@ let send_heartbeats () =
       | Error _grpc_status ->
           Log.debug (fun m -> m "Heartbeat to server %d failed" server_id);
           Lwt.return ())
-    all_server_ids
+    (all_server_ids ())
 
 (* Call RequestVoteRPC *)
 let call_request_vote port candidate_id term last_log_index last_log_term =
@@ -762,16 +788,17 @@ let call_request_vote port candidate_id term last_log_index last_log_term =
 
 let rec heartbeat_loop () =
   (* Send heartbeat to all servers *)
+  Log.debug (fun m -> m "Sending heartbeats");
   send_heartbeats () >>= fun () ->
   Lwt_unix.sleep heartbeat_timeout >>= fun () ->
-  if !role = "leader" then heartbeat_loop () else Lwt.return ()
+  if get_role () = Leader then heartbeat_loop () else Lwt.return ()
 
 (* This function handles the request vote and counting the votes *)
 let check_majority num_votes_received =
   (* Check if we have enough votes for a majority *)
   let total_servers = !num_servers in
   let majority = (total_servers / 2) + 1 in
-  if num_votes_received >= majority && !role <> "leader" then (
+  if num_votes_received >= majority && get_role () <> Leader then (
     (* If we've received a majority, we win the election *)
     Log.debug (fun m ->
         m "We have a majority of votes (%d/%d) at term %d." num_votes_received
@@ -785,7 +812,7 @@ let check_majority num_votes_received =
     in
     match_index := List.init !num_servers (fun _ -> -1);
 
-    role := "leader";
+    set_role Leader;
 
     Lwt.async (fun () -> heartbeat_loop ()))
   else
@@ -796,13 +823,9 @@ let check_majority num_votes_received =
 
 (* Updated send_request_vote_rpcs function *)
 let send_request_vote_rpcs () =
-  let all_server_ids =
-    List.init !num_servers (fun i -> i + 1)
-    |> List.filter (fun server_id -> server_id <> !id)
-  in
   Lwt_list.iter_p
     (fun server_id ->
-      if !role <> "candidate" then Lwt.return_unit
+      if get_role () <> Candidate then Lwt.return_unit
       else
         let port = server_id - 1 + Common.start_server_ports in
         let candidate_id = !id in
@@ -853,30 +876,56 @@ let send_request_vote_rpcs () =
             Log.debug (fun m ->
                 m "RequestVote RPC to server %d failed" server_id);
             Lwt.return_unit)
-    all_server_ids
+    (all_server_ids ())
 
+
+(* Election loop: Handles timeouts and election retries *)
 let rec election_loop () =
-  (* Generate a random election timeout duration between 0.15s and 0.3s * 2 *)
-  let timeout_duration = 0.3 +. Random.float (0.6 -. 0.3) in
-  Lwt_unix.sleep timeout_duration >>= fun () ->
-  (* Check if a message was received or if this node is already a leader *)
-  if (not !messages_recieved) && !role <> "leader" then (
-    Log.debug (fun m -> m "Election timeout reached; starting election...");
+  let timeout_duration =
+    election_timeout_floor +. Random.float election_timeout_additional
+  in
 
-    (*  Begins an election to choose a new leader, self-vote first *)
-    role := "candidate";
-    term := !term + 1;
-    voted_for := !id;
-    votes_received := [ !id ];
-    (* Restart the election timeout and send RequestVote RPCs *)
-    send_request_vote_rpcs () >>= fun () ->
-    (* Back to following *)
-    election_loop () (* Continue the loop *))
-  else (
-    (* Reset message received flag and restart the loop *)
+  let election_timeout =
+    Lwt_unix.sleep timeout_duration >>= fun () ->
+    (* Log.debug (fun m -> m "Election timeout reached"); *)
+    Lwt.return `Timeout
+  in
+
+  if not !messages_recieved && get_role () <> Leader then (
+    (* Election process *)
+    let start_election () =
+      set_role Candidate;
+      term := !term + 1;
+      voted_for := !id;
+      votes_received := [ !id ];
+      Log.info (fun m -> m "Starting election: term=%d, candidate_id=%d" !term !id);
+      send_request_vote_rpcs ()
+    in
+
+    let request_votes =
+      start_election () >>= fun () -> Lwt.return `VotesReceived
+    in
+
+    Lwt.pick [ election_timeout; request_votes ] >>= function
+    | `Timeout ->
+        let failed = Atomic.compare_and_set role Candidate Follower in
+        let* () =
+          if failed then (
+            Log.debug (fun m -> m "Election timeout reached, resetting to follower");
+            set_follower ()
+          ) else
+            Lwt.return_unit
+        in
+        election_loop ()
+    | `VotesReceived ->
+        messages_recieved := false;
+        election_loop ()
+  ) else (
     messages_recieved := false;
-    election_loop ())
-
+    let* _ = election_timeout in
+    election_loop ()
+  )
+  
 let key_value_store_service =
   Server.Service.(
     v ()
@@ -947,7 +996,6 @@ let establish_connections () =
 let start_server () =
   let port = !id - 1 + Common.start_server_ports in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
-  let server_name = Printf.sprintf "raftserver%d" !id in
   try
     let server =
       H2_lwt_unix.Server.create_connection_handler ?config:None
@@ -958,8 +1006,7 @@ let start_server () =
     let+ _server =
       Lwt_io.establish_server_with_client_socket listen_address server
     in
-    Logs.info (fun m ->
-        m "Server %s listening on port %i for grpc requests" server_name port)
+    Logs.info (fun m -> m "Listening on port %i for grpc requests" port)
   with
   | Unix.Unix_error (err, func, arg) ->
       (* Handle Unix system errors *)

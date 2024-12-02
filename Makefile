@@ -4,16 +4,17 @@ DATA_DIR = data
 FRONTEND_EXEC = _build/default/lib/frontend.exe
 SERVER_EXEC = _build/default/lib/server.exe
 LOG_FILE = raft.log
+SRC_FILES = lib/*.ml
 
 # Default target
 all: $(BIN_DIR)/frontend $(BIN_DIR)/server
 
 # Target to build with Dune for frontend
-$(FRONTEND_EXEC):
+$(FRONTEND_EXEC): $(SRC_FILES)
 	$(DUNE_BUILD)
 
 # Target to build with Dune for server
-$(SERVER_EXEC):
+$(SERVER_EXEC): $(SRC_FILES)
 	$(DUNE_BUILD)
 
 # Ensure bin directory exists
@@ -42,7 +43,7 @@ down:
 	@echo "Killing frontend process..."
 	@ps aux | grep 'bin/frontend' | grep -v 'grep' | awk '{print $$2}' | xargs -r kill
 	@echo "Killing server processes..."
-	@ps aux | grep './bin/server' | grep -v 'grep' | awk '{print $$2}' | xargs -r kill
+	@ps aux | grep 'raftserver' | grep -v 'grep' | awk '{print $$2}' | xargs -r kill
 
 # Clean build artifacts and bin directory
 clean: down
