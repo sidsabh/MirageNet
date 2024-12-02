@@ -2,8 +2,8 @@ open Lwt.Infix
 open Lwt.Syntax
 open Grpc_lwt
 
-let num_servers = 31
-(* let num_servers = 5 *)
+(* let num_servers = 31 *)
+let num_servers = 5
 
 let call_server address port =
   (* Setup Http/2 connection *)
@@ -55,3 +55,5 @@ let () =
          else print_endline "Error starting Raft servers";
          print_endline error
      | Error _ -> print_endline "an error occurred")
+
+     

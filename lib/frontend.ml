@@ -6,6 +6,11 @@ open Raftkv
 open Ocaml_protoc_plugin
 open Common
 
+(* Constants*)
+let timeout_duration = 0.15
+
+module Log = (val setup_logs "frontend")
+
 (* Global state *)
 let num_servers = ref 0
 
@@ -55,28 +60,53 @@ let call_server_rpc ~(server_id : int) ~(rpc_name : string) ~service ~request =
 let send_request_to_leader ~(rpc_name : string) ~service ~request
     ~extract_leader_info =
   let rec loop () =
-    let* result =
+    Log.debug (fun m ->
+        m "%s: Trying raftserver%d as leader" rpc_name !leader_id);
+
+    (* Define a timeout for the RPC call *)
+    let timeout =
+      Lwt_unix.sleep timeout_duration >>= fun () ->
+      Lwt.fail_with
+        (Printf.sprintf "%s: Timeout waiting for server %d" rpc_name !leader_id)
+    in
+
+    (* Attempt the RPC call *)
+    let rpc_call =
       call_server_rpc ~server_id:!leader_id ~rpc_name ~service ~request
     in
-    match result with
-    | Ok response, _ ->
-        let wrong_leader, leader_hint = extract_leader_info response in
-        if wrong_leader then (
-          leader_id := int_of_string leader_hint;
-          Printf.printf "%s: Leader is wrong, trying raftserver%d\n" rpc_name
-            !leader_id;
-          flush stdout;
-          loop ())
-        else (
-          Printf.printf "%s RPC to server %d successful\n" rpc_name !leader_id;
-          flush stdout;
-          Lwt.return response)
-    | Error _, _ ->
-        Printf.printf "%s RPC to server %d failed, trying next server\n"
-          rpc_name !leader_id;
-        flush stdout;
+
+    (* Use Lwt.pick to race the RPC call against the timeout *)
+    Lwt.catch
+      (fun () ->
+        let* result = Lwt.pick [ timeout; rpc_call ] in
+        match result with
+        | Ok response, _ ->
+            let wrong_leader, leader_hint = extract_leader_info response in
+            if wrong_leader then (
+              leader_id := int_of_string leader_hint;
+              Log.debug (fun m ->
+                  m "%s: Leader is wrong, trying raftserver%d" rpc_name
+                    !leader_id);
+              loop ())
+            else (
+              Log.debug (fun m ->
+                  m "%s RPC to server %d successful" rpc_name !leader_id);
+              Lwt.return response)
+        | Error _, _ ->
+            Log.debug (fun m ->
+                m "%s RPC to server %d failed, trying next server" rpc_name
+                  !leader_id);
+            (* Move to the next server *)
+            leader_id := (!leader_id mod !num_servers) + 1;
+            loop ())
+      (fun ex ->
+        (* Handle timeouts and exceptions *)
+        Log.debug (fun m ->
+            m "%s RPC to server %d failed with: %s. Trying next server."
+              rpc_name !leader_id (Printexc.to_string ex));
+        (* Move to the next server *)
         leader_id := (!leader_id mod !num_servers) + 1;
-        loop ()
+        loop ())
   in
   loop ()
 
@@ -91,8 +121,7 @@ let handle_request ~(rpc_name : string) ~frontend_service ~backend_service
   let request = Reader.create buffer |> decode_frontend in
   match request with
   | Ok frontend_req ->
-      Printf.printf "Received %s request\n" rpc_name;
-      flush stdout;
+      Log.debug (fun m -> m "Received %s request" rpc_name);
 
       let backend_request = build_backend_request frontend_req in
       let* backend_response =
@@ -149,22 +178,20 @@ let handle_replace_request buffer =
 let spawn_server i =
   let name = "raftserver" ^ string_of_int i in
   let command =
-    Printf.sprintf
-      "./bin/server %d %d %s 2>&1 | awk '{print \"raftserver%d: \" $0; \
-       fflush()}' >> ./data/raft.log &"
-      i !num_servers name i
+    Printf.sprintf "./bin/server %d %d %s >> ./data/raft.log 2>&1 &" i
+      !num_servers name
   in
   ignore (Sys.command command)
 
 let connect_server i =
-  let port = i + 9000 in
+  let port = i - 1 + Common.start_server_ports in
   let* addresses =
     Lwt_unix.getaddrinfo Common.hostname (string_of_int port)
       [ Unix.(AI_FAMILY PF_INET) ]
   in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-  let error_handler _ = print_endline "error" in
+  let error_handler _ = Log.err (fun m -> m "error") in
   let* connection =
     H2_lwt_unix.Client.create_connection ~error_handler socket
   in
@@ -174,8 +201,7 @@ let connect_server i =
 let read_request buffer decode name =
   Reader.create buffer |> decode |> function
   | Ok v ->
-      Printf.printf "Received %s request with arg: %d\n" name v;
-      flush stdout;
+      Log.debug (fun m -> m "Received %s request with arg: %d" name v);
       v
   | Error e ->
       failwith
@@ -218,10 +244,14 @@ let grpc_routes =
 
 (* Main *)
 let () =
-  let port = 8001 in
+  let port = Common.frontend_port in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
 
-  setup_signal_handler server_connections;
+  setup_signal_handler
+    (fun () ->
+      Log.info (fun m ->
+          m "Received SIGTERM, shutting down, closing all sockets"))
+    server_connections;
 
   (* Server that responds to RPC (listens on 8001)*)
   Lwt.async (fun () ->
@@ -230,14 +260,13 @@ let () =
           ~request_handler:(fun _ reqd ->
             Server.handle_request grpc_routes reqd)
           ~error_handler:(fun _ ?request:_ _ _ ->
-            print_endline "an error occurred")
+            Log.err (fun m -> m "An error occurred while handling a request"))
       in
       let+ _server =
         Lwt_io.establish_server_with_client_socket listen_address server
       in
-      Printf.printf "Frontend service listening on port %i for grpc requests\n"
-        port;
-      flush stdout);
+      Log.info (fun m ->
+          m "Frontend service listening on port %i for grpc requests" port));
 
   (* while(1) *)
   let forever, _ = Lwt.wait () in

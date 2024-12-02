@@ -9,10 +9,16 @@ open Common
 (* Constants *)
 let heartbeat_timeout = 0.1
 let batch_timeout = 0.05
+let rpc_timeout = 0.1
 
 (* Config *)
 let id = ref 0
+
+module Log = (val setup_logs ("raftserver" ^ string_of_int !id))
+
 let num_servers = ref 0
+
+(* Initialize Logging *)
 
 let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
   Hashtbl.create Common.max_connections
@@ -90,11 +96,23 @@ let load_state server_id =
             Lwt.return_unit))
   else Lwt.return_unit
 
+let apply_commited_entries () =
+  let rec loop i =
+    if i <= !commit_index then (
+      let entry = List.nth !log i in
+      Log.debug (fun m -> m "Applying log entry %d: %s" i entry.command);
+      let key, value = Scanf.sscanf entry.command "%s %s" (fun k v -> (k, v)) in
+      Hashtbl.replace kv_store key value;
+      last_applied := i;
+      loop (i + 1))
+  in
+  loop (!last_applied + 1)
+
 let initialize_server_state server_id =
   load_state server_id >>= fun () ->
   Lwt.finalize
     (fun () ->
-      (* Perform server initialization logic here *)
+      apply_commited_entries ();
       Lwt.return_unit)
     (fun () -> save_state server_id)
 
@@ -118,8 +136,7 @@ let handle_get_state_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok _ ->
-      Printf.printf "Received GetState request\n";
-      flush stdout;
+      Log.debug (fun m -> m "Received GetState request");
       let is_leader = !role = "leader" in
       let reply =
         Raftkv.KeyValueStore.GetState.Response.make ~term:!term
@@ -152,26 +169,26 @@ let handle_put_request buffer =
         in
         Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
       else (
-        Printf.printf
-          "Received Put request:\n\
-           {\n\
-           \t\"key\": \"%s\"\n\
-           \t\"value\": \"%s\"\n\
-           \t\"clientId\": %d\n\
-           \t\"requestId\": %d\n\
-           }\n"
-          req_key req_value req_client_id req_request_id;
-        flush stdout;
+        Log.debug (fun m ->
+            m
+              "Received Put request:\n\
+               {\n\
+               \t\"key\": \"%s\"\n\
+               \t\"value\": \"%s\"\n\
+               \t\"clientId\": %d\n\
+               \t\"requestId\": %d\n\
+               }"
+              req_key req_value req_client_id req_request_id);
         let value =
           try
             let already = Hashtbl.find kv_store req_key in
-            "ERROR: already in KV store, value=" ^already
-            with Not_found -> "Success"
-          in
+            "ERROR: already in KV store, value=" ^ already
+          with Not_found -> "Success"
+        in
         let* _ = append_entry req_key req_value in
         let reply =
           Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:""
-            ~value:value ()
+            ~value ()
         in
         Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents)))
   | Error e ->
@@ -199,21 +216,23 @@ let handle_replace_request buffer =
         in
         Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
       else (
-        Printf.printf
-          "Received Replace request:\n\
-           {\n\
-           \t\"key\": \"%s\"\n\
-           \t\"value\": \"%s\"\n\
-           \t\"clientId\": %d\n\
-           \t\"requestId\": %d\n\
-           }\n"
-          req_key req_value req_client_id req_request_id;
-        flush stdout;
+        Log.debug (fun m ->
+            m
+              "Received Replace request:\n\
+               {\n\
+               \t\"key\": \"%s\"\n\n\
+              \                \t\"value\": \"%s\"\n\n\
+              \                \t\"clientId\": %d\n\n\
+              \                \t\"requestId\": %d\n\n\
+              \                }"
+              req_key req_value req_client_id req_request_id);
+
         let value =
           try
             Hashtbl.find kv_store v.key
             (* with Not_found -> failwith "Key not found" *)
-          with Not_found -> "SYSERROR: Key not found" in
+          with Not_found -> "SYSERROR: Key not found"
+        in
         let* _ = append_entry req_key req_value in
         let reply =
           Raftkv.KeyValueStore.Put.Response.make ~wrongLeader:false ~error:""
@@ -240,8 +259,7 @@ let handle_get_request buffer =
         in
         Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
       else (
-        Printf.printf "Received Get request for key: %s\n" v.key;
-        flush stdout;
+        Log.debug (fun m -> m "Received Get request for key: %s" v.key);
         let value =
           try
             Hashtbl.find kv_store v.key
@@ -270,16 +288,16 @@ let handle_request_vote buffer =
       let req_last_log_index = v.last_log_index in
       let req_last_log_term = v.last_log_term in
 
-      Printf.printf
-        "Received RequestVote request:\n\
-         {\n\
-         \t\"candidate_id\": %d\n\
-         \t\"term\": %d\n\
-         \t\"last_log_index\": %d\n\
-         \t\"last_log_term\": %d\n\
-         }\n"
-        req_candidate_id req_term req_last_log_index req_last_log_term;
-      flush stdout;
+      Log.debug (fun m ->
+          m
+            "Received RequestVote request:\n\
+             {\n\
+             \t\"candidate_id\": %d\n\
+             \t\"term\": %d\n\
+             \t\"last_log_index\": %d\n\
+             \t\"last_log_term\": %d\n\
+             }"
+            req_candidate_id req_term req_last_log_index req_last_log_term);
 
       let log_length = List.length !log in
       let last_log_term =
@@ -303,11 +321,14 @@ let handle_request_vote buffer =
         else (
           (* If we haven't voted yet or have voted for this candidate and their log is up-to-date, we vote for them *)
           voted_for := req_candidate_id;
+          messages_recieved := true;
+          (* Added *)
           (true, max req_term !term))
       in
 
-      Printf.printf "vote_granted to %d from me %d? %b my_term %d his term %d\n"
-        req_candidate_id !id vote_granted !term req_term;
+      Log.debug (fun m ->
+          m "vote_granted to %d from me %d: %b;; my_term %d;; their term %d"
+            req_candidate_id !id vote_granted !term req_term);
 
       (* Create the response based on our decision *)
       let reply =
@@ -319,19 +340,6 @@ let handle_request_vote buffer =
       failwith
         (Printf.sprintf "Error decoding RequestVote request: %s"
            (Result.show_error e))
-
-let apply_commited_entries () =
-  let rec loop i =
-    if i <= !commit_index then (
-      let entry = List.nth !log i in
-      Printf.printf "Applying log entry %d: %s\n" i entry.command;
-      flush stdout;
-      let key, value = Scanf.sscanf entry.command "%s %s" (fun k v -> (k, v)) in
-      Hashtbl.replace kv_store key value;
-      last_applied := i;
-      loop (i + 1))
-  in
-  loop (!last_applied + 1)
 
 (* Handle AppendEntriesRPC *)
 let handle_append_entries buffer =
@@ -362,10 +370,9 @@ let handle_append_entries buffer =
       let success = ref true in
 
       if req_leader_commit > !commit_index then
-        Printf.printf
-          "Received leader_commit_index: %d, current commit_index: %d\n"
-          req_leader_commit !commit_index;
-      flush stdout;
+        Log.debug (fun m ->
+            m "Received leader_commit_index: %d, current commit_index: %d"
+              req_leader_commit !commit_index);
 
       if req_entries = [] then (
         if
@@ -386,35 +393,34 @@ let handle_append_entries buffer =
                 votes_received := [];
                 Lwt.return ())
           in
-          Printf.printf "Leader %d recognized, term updated to %d\n"
-            req_leader_id req_term;
-          flush stdout)
+          Log.debug (fun m ->
+              m "New leader recognized: %d, term updated to %d" req_leader_id
+                req_term))
         else if req_term = !term && req_leader_id = !leader_id then
           (* Heartbeat from established leader *)
           messages_recieved := true)
-      else (
-        Printf.printf
-          "Received AppendEntries request:\n\
-           {\n\
-           \t\"term\": %d\n\
-           \t\"leader_id\": %d\n\
-           \t\"commit_length\": %d\n\
-           \t\"prev_log_term\": %d\n\
-           \t\"entries\": [%s\n\
-           \t]\n\
-           \t\"leader_commit\": %d\n\
-           }\n"
-          req_term req_leader_id req_commit_length req_prev_log_term
-          (String.concat ", " (List.map log_entry_to_string req_entries))
-          req_leader_commit;
-        flush stdout);
+      else
+        Log.debug (fun m ->
+            m
+              "Received AppendEntries request:\n\
+               {\n\
+               \t\"term\": %d\n\
+               \t\"leader_id\": %d\n\
+               \t\"commit_length\": %d\n\
+               \t\"prev_log_term\": %d\n\
+               \t\"entries\": [%s\n\
+               \t]\n\
+               \t\"leader_commit\": %d\n\
+               }"
+              req_term req_leader_id req_commit_length req_prev_log_term
+              (String.concat ", " (List.map log_entry_to_string req_entries))
+              req_leader_commit);
 
       (* Condition 1: Reply false if term < currentTerm *)
       if req_term < !term then (
         if req_entries = [] then
-          Printf.printf "Failing heartbeat, req_term: %d, term: %d\n" req_term
-            !term;
-        flush stdout;
+          Log.debug (fun m ->
+              m "Failing heartbeat, req_term: %d, term: %d" req_term !term);
         ignore (success := false);
         ignore (return := true));
 
@@ -425,9 +431,9 @@ let handle_append_entries buffer =
            || (List.nth !log req_commit_length).term <> req_prev_log_term)
       then (
         if req_entries = [] then
-          Printf.printf "Failing heartbeat, commit_length: %d, log length: %d\n"
-            req_commit_length (List.length !log);
-        flush stdout;
+          Log.debug (fun m ->
+              m "Failing heartbeat, commit_length: %d, log length: %d"
+                req_commit_length (List.length !log));
         ignore (success := false);
         ignore (return := true));
 
@@ -477,9 +483,10 @@ let handle_append_entries buffer =
              drop (new_log_length - (req_commit_length + 1)) req_entries
            in
            log := List.concat [ !log; new_entries ];
-           (* Printf.printf "New log after appending entries: %s\n" (String.concat ", " (List.map log_entry_to_string !log)); *)
-           Printf.printf "New log length: %d\n" (List.length !log);
-           flush stdout));
+           Log.debug (fun m ->
+               m "New log after appending entries: %s"
+                 (String.concat ", " (List.map log_entry_to_string !log)));
+           Log.debug (fun m -> m "New log length: %d" (List.length !log))));
 
       (* Condition 5: If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) *)
       if not !return then
@@ -501,6 +508,7 @@ let handle_append_entries buffer =
            (Result.show_error e))
 
 (* Call AppendEntriesRPC *)
+(* Call AppendEntriesRPC with timeout handling *)
 let call_append_entries port commit_length entries =
   let connection = Hashtbl.find server_connections port in
 
@@ -518,21 +526,66 @@ let call_append_entries port commit_length entries =
   in
   let enc = encode req |> Writer.contents in
 
-  Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
-    ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
-    ~handler:
-      (Client.Rpc.unary enc ~f:(fun decoder ->
-           let+ decoder = decoder in
-           match decoder with
-           | Some decoder -> (
-               Reader.create decoder |> decode |> function
-               | Ok v -> v
-               | Error e ->
-                   failwith
-                     (Printf.sprintf "Could not decode request: %s"
-                        (Result.show_error e)))
-           | None -> Raftkv.KeyValueStore.AppendEntries.Response.make ()))
-    ()
+  let rpc_call =
+    Client.call ~service:"raftkv.KeyValueStore" ~rpc:"AppendEntries"
+      ~do_request:(H2_lwt_unix.Client.request connection ~error_handler:ignore)
+      ~handler:
+        (Client.Rpc.unary enc ~f:(fun decoder ->
+             let+ decoder = decoder in
+             match decoder with
+             | Some decoder -> (
+                 Reader.create decoder |> decode |> function
+                 | Ok v -> Ok v
+                 | Error e ->
+                     Error
+                       (Grpc.Status.v ~message:(Result.show_error e)
+                          Grpc.Status.Internal))
+             | None ->
+                 Error
+                   (Grpc.Status.v ~message:"No response received"
+                      Grpc.Status.Unknown)))
+      ()
+  in
+
+  let timeout =
+    Lwt_unix.sleep rpc_timeout >>= fun () ->
+    Lwt.fail_with "AppendEntries timeout"
+  in
+
+  Lwt.catch
+    (fun () ->
+      Lwt.pick [ rpc_call; timeout ] >>= function
+      | Ok (Ok response, _) -> Lwt.return (Ok response)
+      | Ok (Error grpc_status, _) -> Lwt.return (Stdlib.Error grpc_status)
+      | Stdlib.Error _ ->
+          Lwt.return
+            (Stdlib.Error
+               (Grpc.Status.v ~message:"HTTP/2 communication failure"
+                  Grpc.Status.Unknown)))
+    (fun _ex ->
+      Log.debug (fun m ->
+          m "AppendEntries RPC to server port %d failed: %s" port "timeout");
+      Lwt.return
+        (Stdlib.Error
+           (Grpc.Status.v ~message:"RPC failed" Grpc.Status.Deadline_exceeded)))
+
+let set_follower () =
+  role := "follower";
+  voted_for := 0;
+  votes_received := [];
+  messages_recieved := true;
+  ()
+
+(* Function to handle higher term logic *)
+let handle_higher_term new_term =
+  if new_term > !term then (
+    Log.debug (fun m ->
+        m "Found higher term %d (current: %d). Resetting to follower."
+          new_term !term);
+    term := new_term;
+    set_follower ();
+    Lwt.return_false (* Indicate that further processing should stop *))
+  else Lwt.return_true (* Continue processing if no higher term *)
 
 type append_entry_state = {
   mutable successful_replies : int;
@@ -547,19 +600,18 @@ let rec send_entries follower_idx state new_commit_index =
   in
   let new_entries = List.filter verify_index !log in
   Lwt.async (fun () ->
-      let port = 9001 + follower_idx in
+      let port = Common.start_server_ports + follower_idx in
       let* res = call_append_entries port commit_length new_entries in
       match res with
-      | Ok (v, _) ->
+      | Ok v ->
           let _res_term = v.term in
           let res_success = v.success in
           (if res_success then (
              (* Fully updated nodes succeed*)
              state.successful_replies <- state.successful_replies + 1;
-             Printf.printf
-               "AppendEntries RPC to server %d successful, replies: %d\n"
-               (follower_idx + 1) state.successful_replies;
-             flush stdout;
+             Log.debug (fun m ->
+                 m "AppendEntries RPC to server %d successful, replies: %d"
+                   (follower_idx + 1) state.successful_replies);
              Mutex.lock next_index_mutex;
              next_index :=
                List.mapi
@@ -584,14 +636,11 @@ let rec send_entries follower_idx state new_commit_index =
              (* if term matches current term, decrease nextIndex[i] and try again *)
              let res_term = v.term in
              if res_term <> !term then (
-               Printf.printf
-                 "AppendEntries RPC to server %d failed, term mismatch\n"
-                 (follower_idx + 1);
-               flush stdout;
-               term := res_term;
-               role := "follower";
-               voted_for := 0;
-               votes_received := [])
+               Log.debug (fun m ->
+                   m "AppendEntries RPC to server %d failed, term mismatch"
+                     (follower_idx + 1));
+               let _ = handle_higher_term res_term in
+               ())
              else (
                Mutex.lock next_index_mutex;
                next_index :=
@@ -599,12 +648,12 @@ let rec send_entries follower_idx state new_commit_index =
                    (fun i x -> if i = follower_idx then x - 1 else x)
                    !next_index;
                Mutex.unlock next_index_mutex;
-               Printf.printf
-                 "AppendEntries RPC to server %d failed, trying again with \
-                  nextIndex: %d\n"
-                 (follower_idx + 1)
-                 (List.nth !next_index follower_idx);
-               flush stdout;
+               Log.debug (fun m ->
+                   m
+                     "AppendEntries RPC to server %d failed, trying again with \
+                      nextIndex: %d"
+                     (follower_idx + 1)
+                     (List.nth !next_index follower_idx));
                send_entries follower_idx state new_commit_index));
           Lwt.return ()
       | Error _ -> Lwt.return ())
@@ -618,9 +667,9 @@ let rec batch_loop () =
             Lwt.return (List.length !log - 1))
       in
       if !last_batch < new_commit_index then (
-        Printf.printf "Batch loop detected %d new entries\n"
-          (new_commit_index - !last_batch);
-        flush stdout;
+        Log.debug (fun m ->
+            m "Batch loop detected %d new entries"
+              (new_commit_index - !last_batch));
 
         (* Condition to wait for majority to commit *)
         let state =
@@ -652,6 +701,25 @@ let rec batch_loop () =
   in
   batch_loop ()
 
+let send_heartbeats () =
+  let all_server_ids =
+    List.init !num_servers (fun i -> i + 1)
+    |> List.filter (fun server_id -> server_id <> !id)
+  in
+  Lwt_list.iter_p
+    (fun server_id ->
+      let port = server_id - 1 + Common.start_server_ports in
+      let commit_length = List.nth !next_index (server_id - 1) - 1 in
+      let* res = call_append_entries port commit_length [] in
+      match res with
+      | Ok _response ->
+          Log.debug (fun m -> m "Heartbeat to server %d succeeded" server_id);
+          Lwt.return ()
+      | Error _grpc_status ->
+          Log.debug (fun m -> m "Heartbeat to server %d failed" server_id);
+          Lwt.return ())
+    all_server_ids
+
 (* Call RequestVoteRPC *)
 let call_request_vote port candidate_id term last_log_index last_log_term =
   let connection = Hashtbl.find server_connections port in
@@ -673,53 +741,41 @@ let call_request_vote port candidate_id term last_log_index last_log_term =
            let+ decoder = decoder in
            match decoder with
            | Some decoder -> (
-               Reader.create decoder |> decode |> function
-               | Ok v -> v
+               match Reader.create decoder |> decode with
+               | Ok v -> Ok v
                | Error e ->
-                   failwith (* TODO: Remove? *)
-                     (Printf.sprintf "Could not decode request: %s"
-                        (Result.show_error e)))
-           | None -> Raftkv.KeyValueStore.RequestVote.Response.make ()))
+                   Error
+                     (Grpc.Status.v ~message:(Result.show_error e)
+                        Grpc.Status.Internal))
+           | None ->
+               Error
+                 (Grpc.Status.v ~message:"No response received"
+                    Grpc.Status.Unknown)))
     ()
-
-let send_heartbeats () =
-  let all_server_ids =
-    List.init !num_servers (fun i -> i + 1)
-    |> List.filter (fun server_id -> server_id <> !id)
-  in
-  Lwt_list.iter_p
-    (fun server_id ->
-      (* Don't request a vote from yourself *)
-      let port = 9000 + server_id in
-      (* Printf.printf "Leader: Sending heartbeat with commit_length: %d\n" !commit_length;
-         flush stdout; *)
-      let commit_length = List.nth !next_index (server_id - 1) - 1 in
-      let* res = call_append_entries port commit_length [] in
-      match res with
-      | Ok (_, _) ->
-          (* if not res.success then
-             Printf.printf "Heartbeat to server %d returned false\n" server_id; *)
-          Lwt.return ()
-      | Error _ ->
-          (* Printf.printf "Heartbeat to server %d failed\n" server_id; *)
-          Lwt.return ())
-    all_server_ids
+  |> Lwt.map (function
+       | Ok (Ok response, _) -> Ok response
+       | Ok (Error grpc_status, _) -> Error grpc_status
+       | Error _ ->
+           Error
+             (Grpc.Status.v ~message:"HTTP/2 communication failure"
+                Grpc.Status.Unknown))
 
 let rec heartbeat_loop () =
-  Lwt_unix.sleep heartbeat_timeout >>= fun () ->
   (* Send heartbeat to all servers *)
   send_heartbeats () >>= fun () ->
+  Lwt_unix.sleep heartbeat_timeout >>= fun () ->
   if !role = "leader" then heartbeat_loop () else Lwt.return ()
 
 (* This function handles the request vote and counting the votes *)
-let count_votes num_votes_received =
+let check_majority num_votes_received =
   (* Check if we have enough votes for a majority *)
   let total_servers = !num_servers in
   let majority = (total_servers / 2) + 1 in
-  if num_votes_received >= majority then (
+  if num_votes_received >= majority && !role <> "leader" then (
     (* If we've received a majority, we win the election *)
-    Printf.printf "We have a majority of votes (%d/%d) at term %d.\n"
-      num_votes_received total_servers !term;
+    Log.debug (fun m ->
+        m "We have a majority of votes (%d/%d) at term %d." num_votes_received
+          total_servers !term);
     leader_id := !id;
     commit_length := List.length !log - 1;
     let _ =
@@ -731,14 +787,14 @@ let count_votes num_votes_received =
 
     role := "leader";
 
-    (* Send heartbeats for TODO: when does this stop?? *)
     Lwt.async (fun () -> heartbeat_loop ()))
   else
     (* Otherwise, we need to continue gathering votes *)
-    Printf.printf "Votes received: %d, still need more votes.\n"
-      num_votes_received
+    Log.debug (fun m ->
+        m "Votes received: %d, already leader or still need more votes."
+          num_votes_received)
 
-(* Function to request vote from other servers *)
+(* Updated send_request_vote_rpcs function *)
 let send_request_vote_rpcs () =
   let all_server_ids =
     List.init !num_servers (fun i -> i + 1)
@@ -746,45 +802,66 @@ let send_request_vote_rpcs () =
   in
   Lwt_list.iter_p
     (fun server_id ->
-      let port = 9000 + server_id in
-      let candidate_id = !id in
-      let term = !term in
-      let log_length = List.length !log in
-      let last_log_index = if log_length = 0 then 0 else log_length - 1 in
-      let last_log_term =
-        if log_length = 0 then 0 else (List.nth !log last_log_index).term
-      in
-      let* res =
-        call_request_vote port candidate_id term last_log_index last_log_term
-      in
-      match res with
-      | Ok (res, _) ->
-          let ret_term = res.term in
-          let vote_granted = res.vote_granted in
-          Printf.printf "Vote from raftserver%d: %b, term: %d\n" server_id
-            vote_granted ret_term;
-          flush stdout;
-          let* num_votes_received =
-            Lwt_mutex.with_lock votes_mutex (fun () ->
-                if vote_granted && not (List.mem server_id !votes_received) then
-                  votes_received := server_id :: !votes_received;
-                Lwt.return (List.length !votes_received))
+      if !role <> "candidate" then Lwt.return_unit
+      else
+        let port = server_id - 1 + Common.start_server_ports in
+        let candidate_id = !id in
+        let term = !term in
+        let log_length = List.length !log in
+        let last_log_index = if log_length = 0 then 0 else log_length - 1 in
+        let last_log_term =
+          if log_length = 0 then 0 else (List.nth !log last_log_index).term
+        in
+
+        let retry_request () =
+          let timeout =
+            Lwt_unix.sleep rpc_timeout >>= fun () ->
+            Lwt.fail_with "RequestVote timeout"
           in
-          if !role = "candidate" then count_votes num_votes_received;
-          Lwt.return_unit
-      | Error _ ->
-          Printf.printf "RequestVote RPC to server %d failed\n" server_id;
-          Lwt.return ())
+          let rpc_call =
+            call_request_vote port candidate_id term last_log_index
+              last_log_term
+          in
+          Lwt.catch
+            (fun () -> Lwt.pick [ timeout; rpc_call ])
+            (fun _ex ->
+              Log.debug (fun m ->
+                  m "RequestVote RPC to server %d failed: timeout" server_id);
+              Lwt.return_error
+                (Grpc.Status.v ~message:"RPC timed out"
+                   Grpc.Status.Deadline_exceeded))
+        in
+
+        let* res = retry_request () in
+        match res with
+        | Ok response ->
+            let ret_term = response.term in
+            let vote_granted = response.vote_granted in
+            let* continue = handle_higher_term ret_term in
+            if not continue then Lwt.return_unit
+            else if vote_granted && not (List.mem server_id !votes_received)
+            then (
+              let* num_votes_received =
+                Lwt_mutex.with_lock votes_mutex (fun () ->
+                    votes_received := server_id :: !votes_received;
+                    Lwt.return (List.length !votes_received))
+              in
+              check_majority num_votes_received;
+              Lwt.return_unit)
+            else Lwt.return_unit
+        | Error _grpc_status ->
+            Log.debug (fun m ->
+                m "RequestVote RPC to server %d failed" server_id);
+            Lwt.return_unit)
     all_server_ids
 
 let rec election_loop () =
-  (* Generate a random election timeout duration between 0.15s and 0.3s *)
-  let timeout_duration = 0.15 +. Random.float (0.3 -. 0.15) in
+  (* Generate a random election timeout duration between 0.15s and 0.3s * 2 *)
+  let timeout_duration = 0.3 +. Random.float (0.6 -. 0.3) in
   Lwt_unix.sleep timeout_duration >>= fun () ->
   (* Check if a message was received or if this node is already a leader *)
   if (not !messages_recieved) && !role <> "leader" then (
-    Printf.printf "Election timeout reached; starting election...\n";
-    flush stdout;
+    Log.debug (fun m -> m "Election timeout reached; starting election...");
 
     (*  Begins an election to choose a new leader, self-vote first *)
     role := "candidate";
@@ -793,6 +870,7 @@ let rec election_loop () =
     votes_received := [ !id ];
     (* Restart the election timeout and send RequestVote RPCs *)
     send_request_vote_rpcs () >>= fun () ->
+    (* Back to following *)
     election_loop () (* Continue the loop *))
   else (
     (* Reset message received flag and restart the loop *)
@@ -827,7 +905,11 @@ let create_connection address port =
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Lwt_unix.setsockopt socket Unix.SO_REUSEPORT true;
 
-  let src_port = 7001 + (!num_servers * (!id - 1)) + (port - 9001) in
+  let src_port =
+    Common.start_bind_ports
+    + (!num_servers * (!id - 1))
+    + (port - Common.start_server_ports)
+  in
   let bind_address = Unix.ADDR_INET (Unix.inet_addr_loopback, src_port) in
   (* Setup socket*)
   Lwt_unix.bind socket bind_address >>= fun () ->
@@ -856,14 +938,14 @@ let establish_connections () =
   in
 
   let ports_to_connect =
-    List.init !num_servers (fun i -> 9001 + i)
-    |> List.filter (fun p -> p <> !id + 9000)
+    List.init !num_servers (fun i -> Common.start_server_ports + i)
+    |> List.filter (fun p -> p <> !id - 1 + Common.start_server_ports)
   in
 
   establish_for_ports ports_to_connect
 
 let start_server () =
-  let port = 9000 + !id in
+  let port = !id - 1 + Common.start_server_ports in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
   let server_name = Printf.sprintf "raftserver%d" !id in
   try
@@ -876,18 +958,17 @@ let start_server () =
     let+ _server =
       Lwt_io.establish_server_with_client_socket listen_address server
     in
-    Printf.printf "Server %s listening on port %i for grpc requests\n"
-      server_name port;
-    flush stdout
+    Logs.info (fun m ->
+        m "Server %s listening on port %i for grpc requests" server_name port)
   with
   | Unix.Unix_error (err, func, arg) ->
       (* Handle Unix system errors *)
-      Printf.eprintf "Unix error: %s in function %s with argument %s\n"
+      Printf.eprintf "Unix error: %s in function %s with argument %s"
         (Unix.error_message err) func arg;
       Lwt.return ()
   | exn ->
       (* Other error cases *)
-      Printf.eprintf "Error: %s\n" (Printexc.to_string exn);
+      Printf.eprintf "Error: %s" (Printexc.to_string exn);
       Lwt.return ()
 
 (* Main *)
@@ -899,8 +980,12 @@ let () =
   (* Setup *)
   Random.self_init ();
   Random.init ((Unix.time () |> int_of_float) + !id);
-  setup_signal_handler server_connections;
-
+  setup_signal_handler
+    (fun () ->
+      Log.info (fun m ->
+          m "Received SIGTERM, shutting down, closing all sockets"))
+    server_connections;
+  let module Log = (val setup_logs ("raftserver" ^ Sys.argv.(1))) in
   (* Persistent storage loader *)
   ignore (initialize_server_state !id);
 
