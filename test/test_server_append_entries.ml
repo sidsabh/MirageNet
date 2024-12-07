@@ -26,7 +26,7 @@ let call_append_entries address port =
     ]
   in
   let req =
-    Raftkv.AppendEntriesRequest.make ~term:1 ~leader_id:2 ~commit_length:3
+    Raftkv.AppendEntriesRequest.make ~term:1 ~leader_id:2 ~prev_log_index:3
       ~prev_log_term:4 ~entries ~leader_commit:6 ()
   in
   let enc = encode req |> Writer.contents in

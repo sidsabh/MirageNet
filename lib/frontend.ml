@@ -9,6 +9,30 @@ open Common
 (* Constants*)
 let timeout_duration = 0.3
 
+(* Logging *)
+let setup_logs name =
+  (* Create a custom reporter with timestamps including microseconds and additional formatting *)
+  let custom_reporter () =
+    Logs_fmt.reporter
+      ~pp_header:(fun ppf (level, _header) ->
+        let time = Unix.gettimeofday () in
+        let seconds = int_of_float time in
+        let microseconds =
+          int_of_float ((time -. float_of_int seconds) *. 1_000_000.)
+        in
+        let timestamp = Unix.gmtime time in
+        let level_str = Logs.level_to_string (Some level) in
+        Format.fprintf ppf "[%02d:%02d:%02d.%06d] [%s] [%s]: " timestamp.tm_hour
+          timestamp.tm_min timestamp.tm_sec microseconds level_str name)
+      ()
+  in
+
+  Logs.set_reporter (custom_reporter ());
+  Logs.set_level (Some Common.log_level);
+  (* Adjust the log level as needed *)
+  let log = Logs.Src.create name ~doc:(Printf.sprintf "%s logs" name) in
+  (module (val Logs.src_log log : Logs.LOG) : Logs.LOG)
+
 module Log = (val setup_logs "frontend")
 
 (* Global state *)
@@ -220,7 +244,7 @@ let handle_start_raft_request buffer =
     ignore (spawn_server i)
   done;
   (* Wait for a half a sec for the other servers to spawn *)
-  let* _ = Lwt_unix.sleep 0.5 in
+  let* _ = Lwt_unix.sleep Common.startup_wait in
   for i = 1 to request do
     ignore (connect_server i)
   done;
