@@ -271,6 +271,9 @@ let grpc_routes =
 let () =
   let port = Common.frontend_port in
   let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+  Lwt.async_exception_hook := (fun exn ->
+    Logs.err (fun m -> m "Unhandled Lwt exception: %s" (Printexc.to_string exn));
+  );
 
   setup_signal_handler
     (fun () ->

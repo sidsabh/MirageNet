@@ -36,7 +36,7 @@ $(BIN_DIR)/frontend: $(FRONTEND_EXEC) | $(BIN_DIR)
 # Run frontend and server, redirect output to a log file
 up: $(BIN_DIR)/frontend $(BIN_DIR)/server $(DATA_DIR)
 	rm -f $(DATA_DIR)/$(LOG_FILE)
-	$(BIN_DIR)/frontend >> $(DATA_DIR)/$(LOG_FILE) 2>&1 &
+	$(BIN_DIR)/frontend >> $(DATA_DIR)/$(LOG_FILE) 2>&1 & echo $$!
 
 # Rule to kill the frontend and server processes
 down:

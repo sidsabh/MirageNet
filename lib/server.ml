@@ -24,7 +24,6 @@ let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
 let term = ref 0
 let voted_for = ref 0
 let log : Raftkv.LogEntry.t list ref = ref []
-let log_mutex = Lwt_mutex.create () (* Mutex to protect the log *)
 
 let log_entry_to_string (entry : Raftkv.LogEntry.t) =
   Printf.sprintf
@@ -97,12 +96,10 @@ let messages_recieved = ref false
 
 (* Volatile state on leaders *)
 let next_index = ref []
-let next_index_mutex = Mutex.create () (* Mutex to protect the next_index *)
 let match_index = ref []
 
 (* Volatile state on candidates *)
 let votes_received : int list ref = ref []
-let votes_mutex = Lwt_mutex.create ()
 
 (* Global condition variable to trigger immediate heartbeat *)
 let send_entries_flag = Lwt_condition.create ()
@@ -123,13 +120,12 @@ let save_state server_id =
   if Common.persist = false then Lwt.return_unit
   else
   let state = { term = !term; voted_for = !voted_for; log = !log } in
-  Lwt_mutex.with_lock log_mutex (fun () ->
-      let file_path = state_file_path server_id in
+  let file_path = state_file_path server_id in
       Lwt_io.with_file ~mode:Lwt_io.Output file_path (fun channel ->
           let data = Marshal.to_bytes state [] in
           Lwt_io.write_from_string_exactly channel
             (Bytes.unsafe_to_string data)
-            0 (Bytes.length data)))
+            0 (Bytes.length data))
 
 (* Load state from disk *)
 let load_state server_id =
@@ -138,11 +134,10 @@ let load_state server_id =
     Lwt_io.with_file ~mode:Lwt_io.Input file_path (fun channel ->
         Lwt_io.read channel >>= fun data ->
         let state = Marshal.from_bytes (Bytes.of_string data) 0 in
-        Lwt_mutex.with_lock log_mutex (fun () ->
             term := state.term;
             voted_for := state.voted_for;
             log := state.log;
-            Lwt.return_unit))
+            Lwt.return ())
   else Lwt.return_unit
 
 let apply_commited_entries () =
@@ -168,11 +163,7 @@ let initialize_server_state server_id =
 let set_follower () =
   set_role Follower;
   voted_for := 0;
-  let* _ =
-    Lwt_mutex.with_lock votes_mutex (fun () ->
-        votes_received := [];
-        Lwt.return ())
-  in
+  votes_received := [];
   let* _ = save_state !id in
   (* UPDATE TO term/votedfor/log[]*)
   messages_recieved := true;
@@ -284,7 +275,6 @@ let rec send_to_follower follower_idx new_commit_index =
     | Ok (Ok v, _) ->
         if v.success then (
           (* If successful: update nextIndex and matchIndex for follower (§5.3) *)
-          Mutex.lock next_index_mutex;
           next_index :=
             List.mapi
               (fun i x -> if i = follower_idx then new_commit_index + 1 else x)
@@ -293,7 +283,6 @@ let rec send_to_follower follower_idx new_commit_index =
             List.mapi
               (fun i x -> if i = follower_idx then new_commit_index else x)
               !match_index;
-          Mutex.unlock next_index_mutex;
           try_update_commit_index () >>= fun () ->
           Log.debug (fun m ->
               m
@@ -312,12 +301,10 @@ let rec send_to_follower follower_idx new_commit_index =
           Lwt.return_unit)
         else (
           (* Decrement nextIndex and retry *)
-          Mutex.lock next_index_mutex;
           next_index :=
             List.mapi
               (fun i x -> if i = follower_idx then x - 1 else x)
               !next_index;
-          Mutex.unlock next_index_mutex;
           Log.debug (fun m ->
               m "AppendEntries to server %d failed, retry with nextIndex: %d"
                 (follower_idx + 1)
@@ -382,11 +369,7 @@ let check_majority num_votes_received =
     set_role Leader;
     leader_id := !id;
 
-    let _ =
-      Lwt_mutex.with_lock log_mutex (fun () ->
-          next_index := List.init !num_servers (fun _ -> List.length !log);
-          Lwt.return ())
-    in
+    next_index := List.init !num_servers (fun _ -> List.length !log);
     match_index := List.init !num_servers (fun _ -> -1);
 
     (* Start sending heartbeats *)
@@ -461,11 +444,8 @@ let send_request_vote_rpcs () =
             if not higher then Lwt.return_unit
             else if vote_granted && not (List.mem server_id !votes_received)
             then (
-              let* num_votes_received =
-                Lwt_mutex.with_lock votes_mutex (fun () ->
-                    votes_received := server_id :: !votes_received;
-                    Lwt.return (List.length !votes_received))
-              in
+              votes_received := server_id :: !votes_received;
+              let num_votes_received = List.length !votes_received in
               check_majority num_votes_received;
               Lwt.return_unit)
             else Lwt.return_unit
@@ -488,12 +468,7 @@ let attempt_election () =
     Log.debug (fun m -> m "Attempting election at term %d" !term);
     voted_for := !id;
     let* _ = save_state !id in
-
-    let* _ =
-      Lwt_mutex.with_lock votes_mutex (fun () ->
-          votes_received := [ !id ];
-          Lwt.return ())
-    in
+    votes_received := [ !id ];
     send_request_vote_rpcs ())
   else Lwt.return ()
 
@@ -535,13 +510,11 @@ let handle_get_state_request buffer =
 let append_entry key value =
   let command = key ^ " " ^ value in
   let _ =
-    Lwt_mutex.with_lock log_mutex (fun () ->
-        let index = List.length !log in
-        let new_log_entry =
-          Raftkv.LogEntry.make ~term:!term ~command ~index ()
-        in
-        log := !log @ [ new_log_entry ];
-        Lwt.return ())
+  let index = List.length !log in
+  let new_log_entry =
+    Raftkv.LogEntry.make ~term:!term ~command ~index ()
+  in
+  log := !log @ [ new_log_entry ];
   in
   let* _ = save_state !id in
   Lwt.return ()
@@ -721,6 +694,7 @@ let handle_request_vote buffer =
       let has_voted_conflict =
         !voted_for <> 0 && !voted_for <> req_candidate_id
       in
+      let _ = handle_higher_term req_term in
 
       let vote_granted, updated_term =
         match (is_term_stale, has_voted_conflict, log_is_up_to_date) with
@@ -728,12 +702,11 @@ let handle_request_vote buffer =
         | false, true, _ -> (false, !term)
         | false, false, false -> (false, !term)
         | false, false, true ->
-            voted_for := req_candidate_id;
             messages_recieved := true;
+            voted_for := req_candidate_id;
             (true, max req_term !term)
       in
 
-      let _ = handle_higher_term updated_term in
       let reply =
         Raftkv.KeyValueStore.RequestVote.Response.make ~vote_granted
           ~term:updated_term ()
@@ -790,14 +763,14 @@ let handle_append_entries buffer =
 
       (* Determine overall action based on conditions *)
       let action =
-        match (stale_term, log_mismatch, is_heartbeat) with
-        | true, _, _ ->
+        match (stale_term, log_mismatch) with
+        | true, _ ->
             (* §5.1: stale term -> reject *)
             `Reject
-        | false, true, _ ->
+        | false, true ->
             (* §5.3: log mismatch -> reject *)
             `Reject
-        | false, false, true ->
+        | false, false ->
             (* Heartbeat with no stale term and no mismatch *)
             (* If this heartbeat introduces a new leader or confirms existing one *)
             if get_role () = Leader && !term = req_term then
@@ -805,11 +778,11 @@ let handle_append_entries buffer =
             leader_id := req_leader_id;
             term := req_term;
             ignore (set_follower ());
-            `Accept_no_entries
-        | false, false, false ->
+            if is_heartbeat then
+              `Accept_no_entries
             (* Normal AppendEntries with entries *)
-            ignore (set_follower ());
-            `Append_entries
+            else 
+              `Append_entries
       in
 
       let reply =
