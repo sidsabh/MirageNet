@@ -11,6 +11,7 @@ let heartbeat_timeout = 0.1
 let rpc_timeout = 0.1
 let election_timeout_floor = 0.3
 let election_timeout_additional = 0.3
+let majority_wait = 0.01
 
 (* Config *)
 let id = ref 0
@@ -85,16 +86,10 @@ let setup_logs name =
 module Log = (val setup_logs ("raftserver" ^ string_of_int !id))
 
 let set_role new_role =
-  Log.debug (fun m ->
-      m "Changing role from %s to %s"
-        (match get_role () with
-        | Leader -> "Leader"
-        | Follower -> "Follower"
-        | Candidate -> "Candidate")
-        (match new_role with
-        | Leader -> "Leader"
-        | Follower -> "Follower"
-        | Candidate -> "Candidate"));
+  let log_f = if get_role () = new_role then Log.info else fun _ -> () in
+  log_f (fun m ->
+      m "Changing role from %s to %s" (role_to_string (get_role ()))
+        (role_to_string new_role));
   Atomic.set role new_role
 
 let leader_id = ref 0
@@ -109,6 +104,9 @@ let match_index = ref []
 let votes_received : int list ref = ref []
 let votes_mutex = Lwt_mutex.create ()
 
+(* Global condition variable to trigger immediate heartbeat *)
+let send_entries_flag = Lwt_condition.create ()
+
 (* File paths for persistence *)
 let state_file_path server_id =
   Printf.sprintf "data/raft_server_%d_state.dat" server_id
@@ -122,6 +120,8 @@ type persistent_state = {
 
 (* SaveState on changes to term/votedfor/log[]*)
 let save_state server_id =
+  if Common.persist = false then Lwt.return_unit
+  else
   let state = { term = !term; voted_for = !voted_for; log = !log } in
   Lwt_mutex.with_lock log_mutex (fun () ->
       let file_path = state_file_path server_id in
@@ -173,7 +173,7 @@ let set_follower () =
         votes_received := [];
         Lwt.return ())
   in
-  let _ = save_state !id in
+  let* _ = save_state !id in
   (* UPDATE TO term/votedfor/log[]*)
   messages_recieved := true;
   Lwt.return ()
@@ -187,11 +187,6 @@ let handle_higher_term new_term =
     term := new_term;
     set_follower () >>= fun () -> Lwt.return_false)
   else Lwt.return_true (* Continue processing if no higher term *)
-
-type append_entry_state = {
-  mutable successful_replies : int;
-  majority_condition : unit Lwt_condition.t;
-}
 
 let rpc_with_timeout ~timeout_duration ~rpc_call ~log_error =
   let timeout =
@@ -253,48 +248,67 @@ let call_append_entries port prev_log_index entries =
       Log.debug (fun m ->
           m "AppendEntries RPC to server port %d failed: timeout" port))
 
-(* Runs concurrently *)
-let rec send_entries follower_idx state new_commit_index =
-  let commit_length = (List.nth !next_index follower_idx) - 1 in
-  let verify_index (entry : Raftkv.LogEntry.t) =
-    entry.index > commit_length && entry.index <= new_commit_index
+let all_server_ids () =
+  List.init !num_servers (fun i -> i + 1)
+  |> List.filter (fun server_id -> server_id <> !id)
+
+let try_update_commit_index () =
+  (* If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4). *)
+  (* try to continously update commit_index to commit_index+1 *)
+  let condition_satisfied potential_index =
+    let match_indices = List.map (fun x -> x >= potential_index) !match_index in
+    let majority = (List.length match_indices / 2) + 1 in
+    List.length (List.filter (fun x -> x) match_indices) >= majority
   in
-  let new_entries = List.filter verify_index !log in
-  let port = Common.start_server_ports + follower_idx in
-  let* res = call_append_entries port commit_length new_entries in
-  match res with
-  | Ok (Ok v, _) ->
-      let res_success = v.success in
-      if res_success then (
-        (* Update nextIndex and matchIndex on success *)
-        state.successful_replies <- state.successful_replies + 1;
-        Log.debug (fun m ->
-            m "AppendEntries to server %d succeeded, replies: %d"
-              (follower_idx + 1) state.successful_replies);
-        Mutex.lock next_index_mutex;
-        next_index :=
-          List.mapi
-            (fun i x -> if i = follower_idx then new_commit_index + 1 else x)
-            !next_index;
-        match_index :=
-          List.mapi
-            (fun i x -> if i = follower_idx then new_commit_index else x)
-            !match_index;
-        Mutex.unlock next_index_mutex;
-        (* Check majority *)
-        if state.successful_replies >= (!num_servers / 2) + 1 then (
-          if new_commit_index > !commit_index then
-            commit_index := new_commit_index;
-          Lwt_condition.signal state.majority_condition ());
-        Lwt.return_unit)
-      else
-        (* If AppendEntries fails due to log inconsistency or term mismatch *)
-        let res_term = v.term in
-        if res_term <> !term then (
+  let rec loop () =
+    if condition_satisfied (!commit_index + 1) then (
+      commit_index := !commit_index + 1;
+      apply_commited_entries ();
+      loop ())
+    else Lwt.return ()
+  in
+  loop ()
+
+let rec send_to_follower follower_idx new_commit_index =
+  (* last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex *)
+  if get_role () <> Leader then Lwt.return_unit
+  else
+    let prev_log_index = List.nth !next_index follower_idx - 1 in
+    let verify_index (entry : Raftkv.LogEntry.t) =
+      entry.index > prev_log_index && entry.index <= new_commit_index
+    in
+    let new_entries = List.filter verify_index !log in
+    let port = Common.start_server_ports + follower_idx in
+    let* res = call_append_entries port prev_log_index new_entries in
+    match res with
+    | Ok (Ok v, _) ->
+        if v.success then (
+          (* If successful: update nextIndex and matchIndex for follower (§5.3) *)
+          Mutex.lock next_index_mutex;
+          next_index :=
+            List.mapi
+              (fun i x -> if i = follower_idx then new_commit_index + 1 else x)
+              !next_index;
+          match_index :=
+            List.mapi
+              (fun i x -> if i = follower_idx then new_commit_index else x)
+              !match_index;
+          Mutex.unlock next_index_mutex;
+          try_update_commit_index () >>= fun () ->
+          Log.debug (fun m ->
+              m
+                (if new_entries = [] then "Heartbeat to server %d succeeded"
+                 else "AppendEntries to server %d succeeded")
+                (follower_idx + 1));
+          Lwt.return_unit)
+        else if
+          (* If AppendEntries fails because of log inconsistency: decrement nextIndex and retry (§5.3) *)
+          v.term > !term
+        then (
           Log.debug (fun m ->
               m "AppendEntries to server %d failed (term mismatch)"
                 (follower_idx + 1));
-          let _ = handle_higher_term res_term in
+          let _ = handle_higher_term v.term in
           Lwt.return_unit)
         else (
           (* Decrement nextIndex and retry *)
@@ -308,36 +322,81 @@ let rec send_entries follower_idx state new_commit_index =
               m "AppendEntries to server %d failed, retry with nextIndex: %d"
                 (follower_idx + 1)
                 (List.nth !next_index follower_idx));
-          send_entries follower_idx state new_commit_index)
-  | Ok (Error grpc_status, _) ->
-      Log.debug (fun m ->
-          m "AppendEntries failed to server %d: %s" (follower_idx + 1)
-            (Grpc.Status.show grpc_status));
-      Lwt.return_unit
-  | Error grpc_status ->
-      Log.debug (fun m ->
-          m "Communication error to server %d: %s" (follower_idx + 1)
-            (Grpc.Status.show grpc_status));
-      Lwt.return_unit
+          send_to_follower follower_idx new_commit_index)
+    | Ok (Error grpc_status, _) ->
+        Log.debug (fun m ->
+            m "AppendEntries failed to server %d: %s" (follower_idx + 1)
+              (Grpc.Status.show grpc_status));
+        Lwt.return_unit
+    | Error grpc_status ->
+        Log.debug (fun m ->
+            m "Communication error to server %d: %s" (follower_idx + 1)
+              (Grpc.Status.show grpc_status));
+        Lwt.return_unit
 
-let all_server_ids () =
-  List.init !num_servers (fun i -> i + 1)
-  |> List.filter (fun server_id -> server_id <> !id)
-
-let send_heartbeats () =
+let send_updates_or_heartbeats () =
+  let new_commit_index = List.length !log - 1 in
   Lwt_list.iter_p
     (fun server_id ->
-      let port = server_id - 1 + Common.start_server_ports in
-      let commit_length = List.nth !next_index (server_id - 1) - 1 in
-      let* res = call_append_entries port commit_length [] in
-      match res with
-      | Ok _response ->
-          Log.debug (fun m -> m "Heartbeat to server %d succeeded" server_id);
-          Lwt.return ()
-      | Error _grpc_status ->
-          Log.debug (fun m -> m "Heartbeat to server %d failed" server_id);
-          Lwt.return ())
+      let follower_idx = server_id - 1 in
+      send_to_follower follower_idx new_commit_index)
     (all_server_ids ())
+
+(* Modified heartbeat loop *)
+let heartbeat () =
+  let rec heartbeat_loop () =
+    Lwt.pick
+      [
+        (* Option 1: Triggered by client request *)
+        ( Lwt_condition.wait send_entries_flag >>= fun () ->
+          Log.debug (fun m -> m "appendEntries triggered by client request");
+          send_updates_or_heartbeats () >>= fun () -> Lwt.return () );
+        (* Option 2: Regular heartbeat timeout *)
+        ( Lwt_unix.sleep heartbeat_timeout >>= fun () ->
+          send_updates_or_heartbeats () >>= fun () ->
+          Log.debug (fun m -> m "Sending heartbeats");
+          Lwt.return () );
+      ]
+    >>= fun () ->
+    if get_role () = Leader then heartbeat_loop () else Lwt.return ()
+  in
+  (* Send initial heartbeat then loop *)
+  if get_role () = Leader then
+    send_updates_or_heartbeats () >>= fun () -> heartbeat_loop ()
+  else Lwt.return ()
+
+(* Function to trigger the heartbeat loop immediately *)
+let trigger_send_entries () = Lwt_condition.signal send_entries_flag ()
+
+(* This function handles the request vote and counting the votes *)
+let check_majority num_votes_received =
+  let total_servers = !num_servers in
+  let majority = (total_servers / 2) + 1 in
+  if num_votes_received >= majority && get_role () = Candidate then (
+    (* If we've received a majority, we win the election *)
+    Log.debug (fun m ->
+        m "We have a majority of votes (%d/%d) at term %d." num_votes_received
+          total_servers !term);
+
+    (* Become leader *)
+    set_role Leader;
+    leader_id := !id;
+
+    let _ =
+      Lwt_mutex.with_lock log_mutex (fun () ->
+          next_index := List.init !num_servers (fun _ -> List.length !log);
+          Lwt.return ())
+    in
+    match_index := List.init !num_servers (fun _ -> -1);
+
+    (* Start sending heartbeats *)
+    Lwt.async (fun () -> heartbeat ())
+    (* TODO: only send during idle periods *)
+    (* No need to return anything here; loops run asynchronously *))
+  else
+    Log.debug (fun m ->
+        m "Votes received: %d, not enough for majority or already leader."
+          num_votes_received)
 
 (* Call RequestVoteRPC *)
 let call_request_vote port candidate_id term last_log_index last_log_term =
@@ -376,43 +435,6 @@ let call_request_vote port candidate_id term last_log_index last_log_term =
   rpc_with_timeout ~timeout_duration:rpc_timeout ~rpc_call ~log_error:(fun () ->
       Log.debug (fun m ->
           m "RequestVote RPC to server port %d failed: timeout" port))
-
-let rec heartbeat_loop () =
-  (* Send heartbeat to all servers *)
-  Log.debug (fun m -> m "Sending heartbeats");
-  send_heartbeats () >>= fun () ->
-  Lwt_unix.sleep heartbeat_timeout >>= fun () ->
-  if get_role () = Leader then heartbeat_loop () else Lwt.return ()
-
-(* This function handles the request vote and counting the votes *)
-let check_majority num_votes_received =
-  let total_servers = !num_servers in
-  let majority = (total_servers / 2) + 1 in
-  if num_votes_received >= majority && get_role () = Candidate then (
-    (* If we've received a majority, we win the election *)
-    Log.debug (fun m ->
-        m "We have a majority of votes (%d/%d) at term %d." num_votes_received
-          total_servers !term);
-
-    (* Become leader *)
-    set_role Leader;
-    leader_id := !id;
-
-    let _ =
-      Lwt_mutex.with_lock log_mutex (fun () ->
-          next_index := List.init !num_servers (fun _ -> List.length !log);
-          Lwt.return ())
-    in
-    match_index := List.init !num_servers (fun _ -> -1);
-
-    (* Start sending heartbeats *)
-    Lwt.async (fun () -> heartbeat_loop ())
-    (* TODO: only send during idle periods *)
-    (* No need to return anything here; loops run asynchronously *))
-  else
-    Log.debug (fun m ->
-        m "Votes received: %d, not enough for majority or already leader."
-          num_votes_received)
 
 (* Updated send_request_vote_rpcs function *)
 let send_request_vote_rpcs () =
@@ -461,13 +483,12 @@ let send_request_vote_rpcs () =
 (* Attempt election *)
 let attempt_election () =
   if (not !messages_recieved) && get_role () <> Leader then (
-    Log.debug (fun m -> m "Attempting election at term %d" !term);
     set_role Candidate;
     term := !term + 1;
+    Log.debug (fun m -> m "Attempting election at term %d" !term);
     voted_for := !id;
-    let _ = save_state !id in
+    let* _ = save_state !id in
 
-    (* UPDATE TO term/votedfor/log[]*)
     let* _ =
       Lwt_mutex.with_lock votes_mutex (fun () ->
           votes_received := [ !id ];
@@ -511,67 +532,77 @@ let handle_get_state_request buffer =
         (Printf.sprintf "Error decoding GetState request: %s"
            (Result.show_error e))
 
-let replicate_and_commit new_entry_index =
-  let state =
-    { successful_replies = 0; majority_condition = Lwt_condition.create () }
-  in
-  (* Send AppendEntries to all followers *)
-  let* () =
-    Lwt_list.iter_p
-      (fun server_id ->
-        let follower_idx = server_id - 1 in
-        send_entries follower_idx state new_entry_index)
-      (all_server_ids ())
-  in
-
-  (* Wait until a majority is reached *)
-  let* () = Lwt_condition.wait state.majority_condition in
-  apply_commited_entries ();
-  Lwt.return ()
-
 let append_entry key value =
   let command = key ^ " " ^ value in
-  let _ = Lwt_mutex.with_lock log_mutex (fun () ->
-      let index = List.length !log in
-      let new_log_entry = Raftkv.LogEntry.make ~term:!term ~command ~index () in
-      log := !log @ [ new_log_entry ];
-      Lwt.return ()) in
-  let _ = save_state !id in
+  let _ =
+    Lwt_mutex.with_lock log_mutex (fun () ->
+        let index = List.length !log in
+        let new_log_entry =
+          Raftkv.LogEntry.make ~term:!term ~command ~index ()
+        in
+        log := !log @ [ new_log_entry ];
+        Lwt.return ())
+  in
+  let* _ = save_state !id in
   Lwt.return ()
 
 let append_and_replicate key value =
   let* () = append_entry key value in
   let new_entry_index = List.length !log - 1 in
-  (* replicate and commit synchronously before responding to the client *)
-  let* () = replicate_and_commit new_entry_index in
+  (* update my match index: *)
+  match_index :=
+    List.mapi
+      (fun i x -> if i = !id - 1 then new_entry_index else x)
+      !match_index;
+  (* If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4). *)
+  let condition_satisfied () =
+    let match_indices = List.map (fun x -> x >= new_entry_index) !match_index in
+    let majority = (List.length match_indices / 2) + 1 in
+    Log.debug (fun m ->
+      m "Checking if condition is satisfied for commit index update");
+    List.length (List.filter (fun x -> x) match_indices) >= majority
+  in
+  trigger_send_entries ();
+  let rec wait_for_condition () =
+    if condition_satisfied () then Lwt.return ()
+    else if get_role () <> Leader then Lwt.return ()
+    else Lwt_unix.sleep majority_wait >>= fun () -> wait_for_condition ()
+  in
+  let* () = wait_for_condition () in
+  commit_index := new_entry_index;
+  apply_commited_entries ();
   Lwt.return ()
 
 (* Generic function to handle write requests like Put/Replace *)
-let handle_write_request
-    ~op_name
-    ~service_decode_encode
-    ~make_response
-    ~process_key_value
-    buffer =
+let handle_write_request ~op_name ~service_decode_encode ~make_response
+    ~process_key_value buffer =
   let decode, encode = service_decode_encode in
   match Reader.create buffer |> decode with
   | Error e ->
-      failwith (Printf.sprintf "Error decoding %s request: %s" op_name (Result.show_error e))
+      failwith
+        (Printf.sprintf "Error decoding %s request: %s" op_name
+           (Result.show_error e))
   | Ok (v : Raftkv.KeyValue.t) ->
       let req_key = v.key in
       let req_value = v.value in
       let req_client_id = v.clientId in
       let req_request_id = v.requestId in
 
-      let* reply : Raftkv.KeyValueStore.Put.Response.t =
-        if get_role () <> Leader then (
+      let* (reply : Raftkv.KeyValueStore.Put.Response.t) =
+        if get_role () <> Leader then
           let correct_leader = string_of_int !leader_id in
-          Lwt.return (make_response ~wrongLeader:true ~error:"" ~value:correct_leader)
-        ) else (
+          Lwt.return
+            (make_response ~wrongLeader:true ~error:"" ~value:correct_leader)
+        else
           let value = process_key_value req_key req_value in
           let* _ = append_and_replicate req_key req_value in
-          Lwt.return (make_response ~wrongLeader:false ~error:"" ~value)
-        )
+          if get_role () = Leader then
+            Lwt.return
+              (make_response ~wrongLeader:false ~error:"" ~value)
+          else
+            (* Short circuited, never could enforce commit, not leader anymore *)
+            Lwt.return
+              (make_response ~wrongLeader:true ~error:"" ~value:(string_of_int !leader_id))
       in
 
       Log.info (fun m ->
@@ -585,7 +616,8 @@ let handle_write_request
              \t\"response_value\": \"%s\"\n\
              \t\"wrongLeader\": %b\n\
              }"
-            op_name req_key req_value req_client_id req_request_id reply.value reply.wrongLeader);
+            op_name req_key req_value req_client_id req_request_id reply.value
+            reply.wrongLeader);
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
 (* Handle Put *)
@@ -596,14 +628,12 @@ let handle_put_request buffer =
       "ERROR: already in KV store, value=" ^ already
     with Not_found -> "Success"
   in
-  handle_write_request
-    ~op_name:"Put"
-    ~service_decode_encode:(Service.make_service_functions Raftkv.KeyValueStore.put)
+  handle_write_request ~op_name:"Put"
+    ~service_decode_encode:
+      (Service.make_service_functions Raftkv.KeyValueStore.put)
     ~make_response:(fun ~wrongLeader ~error ~value ->
-      Raftkv.KeyValueStore.Put.Response.make ~wrongLeader ~error ~value ()
-    )
-    ~process_key_value
-    buffer
+      Raftkv.KeyValueStore.Put.Response.make ~wrongLeader ~error ~value ())
+    ~process_key_value buffer
 
 (* Handle Replace *)
 let handle_replace_request buffer =
@@ -613,14 +643,12 @@ let handle_replace_request buffer =
       "Old key:" ^ old_val
     with Not_found -> "SYSERROR: Key not found"
   in
-  handle_write_request
-    ~op_name:"Replace"
-    ~service_decode_encode:(Service.make_service_functions Raftkv.KeyValueStore.replace)
+  handle_write_request ~op_name:"Replace"
+    ~service_decode_encode:
+      (Service.make_service_functions Raftkv.KeyValueStore.replace)
     ~make_response:(fun ~wrongLeader ~error ~value ->
-      Raftkv.KeyValueStore.Replace.Response.make ~wrongLeader ~error ~value ()
-    )
-    ~process_key_value
-    buffer
+      Raftkv.KeyValueStore.Replace.Response.make ~wrongLeader ~error ~value ())
+    ~process_key_value buffer
 
 (* Handle Get *)
 let handle_get_request buffer =
@@ -630,10 +658,11 @@ let handle_get_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok v ->
-      let reply = 
+      let reply =
         if get_role () <> Leader then
           let correct_leader = string_of_int !leader_id in
-            Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:true ~error:"" ~value:correct_leader ()
+          Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:true ~error:""
+            ~value:correct_leader ()
         else
           let value =
             try
@@ -641,20 +670,21 @@ let handle_get_request buffer =
               (* with Not_found -> failwith "Key not found" *)
             with Not_found -> "Key not found"
           in
-            Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:false ~error:"" ~value ()
-        in
-        Log.info (fun m ->
+          Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:false ~error:""
+            ~value ()
+      in
+      Log.info (fun m ->
           m
             "Received get request:\n\
-            {\n\
-            \t\"key\": \"%s\"\n\
-            \t\"clientId\": %d\n\
-            \t\"requestId\": %d\n\
-            \t\"wrongLeader\": %b\n\
-            \t\"response_value\": \"%s\"\n\
-            }"
-            v.key v.clientId v.requestId  reply.wrongLeader reply.value);
-        Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+             {\n\
+             \t\"key\": \"%s\"\n\
+             \t\"clientId\": %d\n\
+             \t\"requestId\": %d\n\
+             \t\"wrongLeader\": %b\n\
+             \t\"response_value\": \"%s\"\n\
+             }"
+            v.key v.clientId v.requestId reply.wrongLeader reply.value);
+      Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
   | Error e ->
       failwith
         (Printf.sprintf "Error decoding Get request: %s" (Result.show_error e))
@@ -778,6 +808,7 @@ let handle_append_entries buffer =
             `Accept_no_entries
         | false, false, false ->
             (* Normal AppendEntries with entries *)
+            ignore (set_follower ());
             `Append_entries
       in
 
@@ -823,7 +854,7 @@ let handle_append_entries buffer =
             (* Update log - first truncate our log if not matching, then only add the new entries *)
             log := truncate_log_if_conflict !log req_entries req_prev_log_index;
             let new_log_length = List.length !log in
-            if new_log_length < (req_prev_log_index + List.length req_entries + 1)
+            if new_log_length < req_prev_log_index + List.length req_entries + 1
             then (
               let new_entries =
                 drop (new_log_length - (req_prev_log_index + 1)) req_entries
@@ -850,33 +881,28 @@ let handle_append_entries buffer =
         apply_commited_entries ());
 
       (* Logging summary only if entries were sent or something changed *)
-      let log_f = if not is_heartbeat then
-        Log.info 
-      else
-        Log.debug
-      in
-      log_f 
-        (fun m ->
-            m
-              "AppendEntries Summary:\n\
-               {\n\
-               \t\"received_term\": %d,\n\
-               \t\"received_leader_id\": %d,\n\
-               \t\"received_prev_log_index\": %d,\n\
-               \t\"received_prev_log_term\": %d,\n\
-               \t\"received_entries\": [%s\n\
-               \t],\n\
-               \t\"received_leader_commit\": %d,\n\
-               \t\"current_term\": %d,\n\
-               \t\"current_leader_id\": %d,\n\
-               \t\"log_length\": %d,\n\
-               \t\"commit_index\": %d,\n\
-               \t\"success\": %b\n\
-               }"
-              req_term req_leader_id req_prev_log_index req_prev_log_term
-              (String.concat ", " (List.map log_entry_to_string req_entries))
-              req_leader_commit !term !leader_id (List.length !log)
-              !commit_index reply.success);
+      let log_f = if not is_heartbeat then Log.info else fun _ -> () in
+      log_f (fun m ->
+          m
+            "AppendEntries Summary:\n\
+             {\n\
+             \t\"received_term\": %d,\n\
+             \t\"received_leader_id\": %d,\n\
+             \t\"received_prev_log_index\": %d,\n\
+             \t\"received_prev_log_term\": %d,\n\
+             \t\"received_entries\": [%s\n\
+             \t],\n\
+             \t\"received_leader_commit\": %d,\n\
+             \t\"current_term\": %d,\n\
+             \t\"current_leader_id\": %d,\n\
+             \t\"log_length\": %d,\n\
+             \t\"commit_index\": %d,\n\
+             \t\"success\": %b\n\
+             }"
+            req_term req_leader_id req_prev_log_index req_prev_log_term
+            (String.concat ", " (List.map log_entry_to_string req_entries))
+            req_leader_commit !term !leader_id (List.length !log) !commit_index
+            reply.success);
 
       Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
 
