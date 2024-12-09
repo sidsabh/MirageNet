@@ -8,7 +8,9 @@ open Common
 
 (* Constants*)
 let timeout_duration = 0.3
+let get_vm_addr i = Printf.sprintf "192.168.100.%d" (i + 100)
 
+(* Signal handler *)
 (* Logging *)
 let setup_logs name =
   (* Create a custom reporter with timestamps including microseconds and additional formatting *)
@@ -211,16 +213,18 @@ let spawn_server i =
 let connect_server i =
   let port = i - 1 + Common.start_server_ports in
   let* addresses =
-    Lwt_unix.getaddrinfo Common.hostname (string_of_int port)
+    Lwt_unix.getaddrinfo (get_vm_addr i) (string_of_int port)
       [ Unix.(AI_FAMILY PF_INET) ]
   in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Log.debug (fun m -> m "Connecting to %s:%d" (get_vm_addr i) port);
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-  let error_handler _ = Log.err (fun m -> m "error") in
+  let error_handler _ = Log.err (fun m -> m "error LOL") in
   let* connection =
     H2_lwt_unix.Client.create_connection ~error_handler socket
   in
   Hashtbl.add server_connections port connection;
+  Log.debug (fun m -> m "Connected to %s:%d" (get_vm_addr i) port);
   Lwt.return ()
 
 let read_request buffer decode name =
@@ -294,6 +298,11 @@ let () =
         Lwt_io.establish_server_with_client_socket listen_address server
       in
       Log.info (fun m -> m "Listening on port %i for grpc requests" port));
+
+    num_servers := 5;
+    for i = 1 to !num_servers do
+      ignore (connect_server i)
+    done;
 
   (* while(1) *)
   let forever, _ = Lwt.wait () in

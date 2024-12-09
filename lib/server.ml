@@ -50,10 +50,9 @@ let role_to_string = function
   | Candidate -> "Candidate"
 
 (* Atomic variable to store the current role *)
-let role = Atomic.make Follower
+let role = ref Follower
 
 (* Helper functions to log and manipulate the role *)
-let get_role () = Atomic.get role
 
 (* Initialize Logging *)
 let setup_logs name =
@@ -69,7 +68,7 @@ let setup_logs name =
         let timestamp = Unix.gmtime time in
         let level_str = Logs.level_to_string (Some level) in
         let current_term = !term in
-        let current_role = role_to_string (get_role ()) in
+        let current_role = role_to_string (!role) in
         Format.fprintf ppf "[%02d:%02d:%02d.%06d] [%s] [%s|%s in Term %d]: "
           timestamp.tm_hour timestamp.tm_min timestamp.tm_sec microseconds
           level_str name current_role current_term)
@@ -85,11 +84,11 @@ let setup_logs name =
 module Log = (val setup_logs ("raftserver" ^ string_of_int !id))
 
 let set_role new_role =
-  let log_f = if get_role () = new_role then Log.info else fun _ -> () in
+  let log_f = if !role = new_role then Log.info else fun _ -> () in
   log_f (fun m ->
-      m "Changing role from %s to %s" (role_to_string (get_role ()))
+      m "Changing role from %s to %s" (role_to_string (!role))
         (role_to_string new_role));
-  Atomic.set role new_role
+  role := new_role
 
 let leader_id = ref 0
 let messages_recieved = ref false
@@ -103,6 +102,14 @@ let votes_received : int list ref = ref []
 
 (* Global condition variable to trigger immediate heartbeat *)
 let send_entries_flag = Lwt_condition.create ()
+
+
+(* VM *)
+let get_vm_addr id =
+  Unix.inet_addr_of_string (Printf.sprintf "192.168.100.%d" (id + 100))
+
+let get_vm_string id = Printf.sprintf "192.168.100.%d" (id + 100)
+
 
 (* File paths for persistence *)
 let state_file_path server_id =
@@ -262,7 +269,7 @@ let try_update_commit_index () =
 
 let rec send_to_follower follower_idx new_commit_index =
   (* last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex *)
-  if get_role () <> Leader then Lwt.return_unit
+  if !role <> Leader then Lwt.return_unit
   else
     let prev_log_index = List.nth !next_index follower_idx - 1 in
     let verify_index (entry : Raftkv.LogEntry.t) =
@@ -345,10 +352,10 @@ let heartbeat () =
           Lwt.return () );
       ]
     >>= fun () ->
-    if get_role () = Leader then heartbeat_loop () else Lwt.return ()
+    if !role = Leader then heartbeat_loop () else Lwt.return ()
   in
   (* Send initial heartbeat then loop *)
-  if get_role () = Leader then
+  if !role = Leader then
     send_updates_or_heartbeats () >>= fun () -> heartbeat_loop ()
   else Lwt.return ()
 
@@ -359,7 +366,7 @@ let trigger_send_entries () = Lwt_condition.signal send_entries_flag ()
 let check_majority num_votes_received =
   let total_servers = !num_servers in
   let majority = (total_servers / 2) + 1 in
-  if num_votes_received >= majority && get_role () = Candidate then (
+  if num_votes_received >= majority && !role = Candidate then (
     (* If we've received a majority, we win the election *)
     Log.debug (fun m ->
         m "We have a majority of votes (%d/%d) at term %d." num_votes_received
@@ -423,7 +430,7 @@ let call_request_vote port candidate_id term last_log_index last_log_term =
 let send_request_vote_rpcs () =
   Lwt_list.iter_p
     (fun server_id ->
-      if get_role () <> Candidate then Lwt.return_unit
+      if !role <> Candidate then Lwt.return_unit
       else
         let port = server_id - 1 + Common.start_server_ports in
         let candidate_id = !id in
@@ -462,7 +469,7 @@ let send_request_vote_rpcs () =
 
 (* Attempt election *)
 let attempt_election () =
-  if (not !messages_recieved) && get_role () <> Leader then (
+  if (not !messages_recieved) && !role <> Leader then (
     set_role Candidate;
     term := !term + 1;
     Log.debug (fun m -> m "Attempting election at term %d" !term);
@@ -493,7 +500,7 @@ let handle_get_state_request buffer =
   let request = Reader.create buffer |> decode in
   match request with
   | Ok _ ->
-      let is_leader = get_role () = Leader in
+      let is_leader = !role = Leader in
       let reply =
         Raftkv.KeyValueStore.GetState.Response.make ~term:!term
           ~isLeader:is_leader ()
@@ -538,7 +545,7 @@ let append_and_replicate key value =
   trigger_send_entries ();
   let rec wait_for_condition () =
     if condition_satisfied () then Lwt.return ()
-    else if get_role () <> Leader then Lwt.return ()
+    else if !role <> Leader then Lwt.return ()
     else Lwt_unix.sleep majority_wait >>= fun () -> wait_for_condition ()
   in
   let* () = wait_for_condition () in
@@ -562,14 +569,14 @@ let handle_write_request ~op_name ~service_decode_encode ~make_response
       let req_request_id = v.requestId in
 
       let* (reply : Raftkv.KeyValueStore.Put.Response.t) =
-        if get_role () <> Leader then
+        if !role <> Leader then
           let correct_leader = string_of_int !leader_id in
           Lwt.return
             (make_response ~wrongLeader:true ~error:"" ~value:correct_leader)
         else
           let value = process_key_value req_key req_value in
           let* _ = append_and_replicate req_key req_value in
-          if get_role () = Leader then
+          if !role = Leader then
             Lwt.return
               (make_response ~wrongLeader:false ~error:"" ~value)
           else
@@ -632,7 +639,7 @@ let handle_get_request buffer =
   match request with
   | Ok v ->
       let reply =
-        if get_role () <> Leader then
+        if !role <> Leader then
           let correct_leader = string_of_int !leader_id in
           Raftkv.KeyValueStore.Get.Response.make ~wrongLeader:true ~error:""
             ~value:correct_leader ()
@@ -773,7 +780,7 @@ let handle_append_entries buffer =
         | false, false ->
             (* Heartbeat with no stale term and no mismatch *)
             (* If this heartbeat introduces a new leader or confirms existing one *)
-            if get_role () = Leader && !term = req_term then
+            if !role = Leader && !term = req_term then
               failwith "Multiple leaders in the same term, SYSERROR";
             leader_id := req_leader_id;
             term := req_term;
@@ -899,7 +906,7 @@ let grpc_routes =
 
 let start_server () =
   let port = !id - 1 + Common.start_server_ports in
-  let listen_address = Unix.(ADDR_INET (inet_addr_loopback, port)) in
+  let listen_address = Unix.(ADDR_INET (get_vm_addr !id, port)) in
   try
     let server =
       H2_lwt_unix.Server.create_connection_handler ?config:None
@@ -930,15 +937,21 @@ let create_connection address port =
       [ Unix.(AI_FAMILY PF_INET) ]
   in
   let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-  Lwt_unix.setsockopt socket Unix.SO_REUSEPORT true;
 
   let src_port =
     Common.start_bind_ports
     + (!num_servers * (!id - 1))
     + (port - Common.start_server_ports)
   in
-  let bind_address = Unix.ADDR_INET (Unix.inet_addr_loopback, src_port) in
+  let bind_address = Unix.ADDR_INET ((get_vm_addr !id), src_port) in
   (* Setup socket*)
+
+  (* Show bind *)
+  Logs.info (fun m ->
+      m "Binding from %s:%d" (Unix.string_of_inet_addr (get_vm_addr !id)) src_port);
+    Logs.info (fun m ->
+      m "Connecting to %s:%d" address port);
+
   Lwt_unix.bind socket bind_address >>= fun () ->
   Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
   let error_handler _ = print_endline "error" in
@@ -955,13 +968,14 @@ let create_connection address port =
 (* Function to establish connections to all other servers *)
 let establish_connections () =
   (* Wait for a half a second for the other servers to spawn *)
-  Lwt_unix.sleep Common.startup_wait >>= fun () ->
+  let time = float_of_int !id *. 3. in
+  Lwt_unix.sleep time >>= fun () ->
   let ports_to_connect =
     List.init !num_servers (fun i -> Common.start_server_ports + i)
     |> List.filter (fun p -> p <> !id - 1 + Common.start_server_ports)
   in
   Lwt_list.iter_s
-    (fun port -> create_connection Common.hostname port)
+    (fun port -> create_connection ((get_vm_string (port - Common.start_server_ports + 1))) port)
     ports_to_connect
 
 (* Main *)
@@ -982,6 +996,7 @@ let () =
     let* server = start_server () in
     (* server that responds to RPC (listens on 9xxx)*)
     let* () = establish_connections () in
+    Lwt_unix.sleep 15. >>= fun () ->
     setup_signal_handler
       (fun () ->
         let _ = Lwt_io.shutdown_server server in
