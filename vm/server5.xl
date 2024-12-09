@@ -1,9 +1,7 @@
-# server1.xl
-name = "raftserver1"
-kernel = "server.xen"
-type = "pvh"
-memory = 256
+name = "vm5"
+memory = 1024
 vcpus = 1
-on_crash = "preserve"
-vif = [ 'bridge=virbr0' ]
-extra = "raftserver5 5"
+kernel = "/boot/vmlinuz-xen-domu"
+disk = ["tap:qcow2:/home/sidsabh/code/dc/MirageNet/vm/vm5.qcow2,xvda,w"]
+vif = ["bridge=br0,mac=00:16:3e:00:00:05"]
+extra = "console=hvc0 root=/dev/xvda3"

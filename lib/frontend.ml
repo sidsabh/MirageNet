@@ -7,7 +7,7 @@ open Ocaml_protoc_plugin
 open Common
 
 (* Constants*)
-let timeout_duration = 0.3
+let timeout_duration = 5.0
 let get_vm_addr i = Printf.sprintf "192.168.100.%d" (i + 100)
 
 (* Signal handler *)
