@@ -8,3 +8,4 @@ data/*
 **mirage
 duniverse
 _opam
+*.qcow2
