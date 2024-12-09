@@ -5,24 +5,20 @@
 (generate_opam_files true)
 
 (source
- (github username/reponame))
+ (github sidsabh/MirageNet))
 
-(authors "Author Name")
-
-(maintainers "Maintainer Name")
-
-(license LICENSE)
-
-(documentation https://url/to/documentation)
+(license MIT)
 
 (package
  (name MirageNet)
  (allow_empty)
- (synopsis "A short synopsis")
- (description "A longer description")
+ (synopsis "final project")
+ (description "raft on stuff")
  (depends 
   ocaml 
   dune
+  (logs (>= 0.7.0))
+  (logs (>= 0.9.0))
   (grpc-lwt (>= 0.1.0))
   (h2-lwt-unix (>= 0.9.0))
   (ocaml-protoc-plugin (>= 4.4.0)))
