@@ -1,0 +1,9 @@
+# server1.xl
+name = "raftserver1"
+kernel = "server.xen"
+type = "pvh"
+memory = 256
+vcpus = 1
+on_crash = "preserve"
+vif = [ 'bridge=virbr0' ]
+extra = "raftserver5 5"
