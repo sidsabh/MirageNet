@@ -14,6 +14,7 @@ let stack =
 let main = 
  let packages =
   [
+    (* package "ocaml-protoc-plugin"; *)
     package ~pin:"git+file:///home/sidsabh/code/dc/MirageNet/ocaml-protoc-plugin#unix-free" "ocaml-protoc-plugin";
     package "mirage-crypto-rng";
     package "h2-lwt";

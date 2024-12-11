@@ -15,7 +15,7 @@
    mirage-bootvar mirage-bootvar.unix mirage-clock-unix mirage-crypto-rng
    mirage-crypto-rng-mirage mirage-logs mirage-runtime
    mirage-runtime.network mirage-time mirage-unix ocaml-protoc-plugin
-   tcpip.stack-socket tcpip.tcpv4v6-socket tcpip.udpv4v6-socket tls-mirage)
+   tcpip.stack-socket tcpip.tcpv4v6-socket tcpip.udpv4v6-socket common raftkv)
  (link_flags (-thread))
  (modules (:standard \ config))
  (flags :standard -w -70 -color always)

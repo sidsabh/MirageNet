@@ -1,0 +1,20 @@
+(library
+ (name common)
+ (modules common)
+ (libraries
+  logs
+  logs.fmt))
+
+(library
+ (name raftkv)
+ (modules raftkv)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  h2
+  h2-lwt-unix
+  logs
+  logs.fmt))

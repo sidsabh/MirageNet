@@ -1,1 +1,1 @@
-(ignored_subdirs ("unikernel"))
+(dirs ("src", "test", "lib", "proto"))
