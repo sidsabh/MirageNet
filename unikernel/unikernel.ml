@@ -2213,8 +2213,7 @@ module RaftServer (R : Mirage_crypto_rng_mirage.S) (Time : Mirage_time.S) (Clock
 (Stack : Tcpip.Stack.V4V6)
 = struct
   module TCP = Stack.TCP
-  module TLS = Tls_mirage.Make (TCP)
-  module Http2 = H2_mirage.Server (TLS)
+  module Http2 = H2_mirage.Server (TCP)
   (* module Server = H2_mirage.Server (Gluten_mirage.Server (TCP)) *)
 
   (* Constants *)
@@ -2232,7 +2231,7 @@ let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
   Hashtbl.create Common.max_connections *)
 
   (* Persistent state on all servers *)
-  let term = ref 0
+  let term = ref 123
   let voted_for = ref 0
   (* let log : Raftkv.LogEntry.t list ref = ref [] *)
 
@@ -2335,7 +2334,7 @@ let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
     | Ok _req ->
         (* Construct response *)
         let is_leader = (* determine if currently leader *) false in
-        let response = Raftkv.State.make ~term:0 ~isLeader:is_leader () in
+        let response = Raftkv.State.make ~term:!term ~isLeader:is_leader () in
         Lwt.return
           (Grpc.Status.(v OK), Some (encode response |> Writer.contents))
 
@@ -2404,13 +2403,18 @@ let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
       Logs.err (fun f -> f "gRPC connection error")
     in
 
-    let server =
+    (* Use the runtime argument for port *)
+    let listening_port = port () in
+    Logs.info (fun f -> f "Starting gRPC server on port %d" listening_port);
+  
+    let http2_handler =
       Http2.create_connection_handler ~request_handler ~error_handler
     in
 
-    (* Listen on the specified port with the H2 connection handler *)
-    (* Stack.listen stack; *)
-    let tcp = TCP.create_connection (Stack.tcp stack) in
-    Stack.listen stack;
+    (* Listen for incoming TCP connections *)
+    TCP.listen (Stack.tcp stack) ~port:listening_port (fun flow ->
+        Logs.info (fun f -> f "Received new TCP connection");
+        http2_handler flow);
+    Stack.listen stack
 
 end
