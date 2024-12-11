@@ -1,1 +1,2 @@
-(dirs ("src", "test", "lib", "proto"))
+(dirs
+ ("src" , "test" , "lib" , "proto"))

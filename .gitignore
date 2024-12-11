@@ -2,10 +2,11 @@ _build
 bin/*
 raft.log
 strace_*
-**CS380D-RaftProject
 data/*
 **dist
 **mirage
 duniverse
 _opam
 *.qcow2
+*xen
+*.in

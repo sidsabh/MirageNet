@@ -1,3 +1,8 @@
 [submodule "ocaml-protoc-plugin"]
 	path = ocaml-protoc-plugin
 	url = git@github.com:sidsabh/ocaml-protoc-plugin.git
+[submodule "test/CS380D-RaftProject"]
+	path = test/CS380D-RaftProject
+	url = https://github.com/asmitalim/CS380D-RaftProject.git
+[submodule "actionbarsherlock"]
+	ignore = dirty

@@ -38,8 +38,9 @@ let call_get_state address port =
 
 let () =
   let open Lwt.Syntax in
-  let port = 8080 in
-  let address = "192.168.122.2" in
+  let port = 9002 in
+  let address = "192.168.122.102" in
+  (* let address = "localhost" in *)
   Lwt_main.run
     (let+ res = call_get_state address port in
      match res with

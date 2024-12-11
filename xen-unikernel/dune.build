@@ -21,7 +21,7 @@
    mirage-clock-solo5 mirage-crypto-rng mirage-crypto-rng-mirage
    mirage-logs mirage-net-xen mirage-runtime mirage-runtime.network
    mirage-time mirage-xen ocaml-protoc-plugin tcpip.icmpv4 tcpip.ipv4
-   tcpip.ipv6 tcpip.stack-direct tcpip.tcp tcpip.udp)
+   tcpip.ipv6 tcpip.stack-direct tcpip.tcp tcpip.udp raftkv common)
  (link_flags :standard -w -70 -color always -cclib "-z solo5-abi=xen")
  (modules (:standard \ config manifest))
  (foreign_stubs (language c) (names manifest))

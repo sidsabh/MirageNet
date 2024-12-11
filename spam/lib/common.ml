@@ -6,5 +6,5 @@ module Common = struct
   let start_server_ports = 9001
   let frontend_port = 8001
   let startup_wait = 0.5
-  let log_level = Logs.Info
+  let log_level = Logs.Debug
 end

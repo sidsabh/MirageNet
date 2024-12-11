@@ -8,7 +8,8 @@ open Common
 
 (* Constants*)
 let timeout_duration = 5.0
-let get_vm_addr i = Printf.sprintf "192.168.100.%d" (i + 100)
+let get_vm_addr i = Printf.sprintf "192.168.122.%d" (i + 100)
+(* let get_vm_addr _i = Printf.sprintf "localhost" *)
 
 (* Signal handler *)
 (* Logging *)
