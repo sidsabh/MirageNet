@@ -1,0 +1,13 @@
+name = 'raft5'
+kernel = 'raft.xen'
+type = 'pvh'
+memory = 128
+on_crash = 'preserve'
+extra = "--id 5 --num-servers 5"  # Pass arguments here
+
+disk = [  ]
+
+# if your system uses openvswitch then either edit /etc/xen/xl.conf and set
+#     vif.default.script="vif-openvswitch"
+# or add "script=vif-openvswitch," before the "bridge=" below:
+vif = [ 'bridge=virbr0' ]

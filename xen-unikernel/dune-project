@@ -1,6 +1,6 @@
 (lang dune 2.9)
 
-(name raft-unix)
+(name raft-xen)
 
 (implicit_transitive_deps true)
 

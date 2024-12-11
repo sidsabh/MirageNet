@@ -1,35 +1,35 @@
 open Mirage
 
-(* Define the main unikernel entrypoint *)
-let main = main "Unikernel.Main" (stackv4v6 @-> job)
-
-(* Use the default network interface (Xen backend) *)
-let net = default_network
-
-(* 
-   Define a static IPv4 configuration.
-   ipv4_config requires a network prefix and an optional gateway.
-   
-   Here:
-   - IP: 192.168.122.2
-   - Netmask: 255.255.255.0 (i.e. /24)
-   - Gateway: 192.168.122.1
-
-   Convert IP/netmask to a prefix:
-   "192.168.122.2/24" means the host's assigned IP is 192.168.122.2
-   within the 192.168.122.0/24 network.
-*)
-let prefix = Ipaddr.V4.Prefix.of_string_exn "192.168.122.2/24"
-let gateway = Some (Ipaddr.V4.of_string_exn "192.168.122.1")
-
-(* Create the IPv4 configuration record *)
-let ipv4_config : ipv4_config = { network = prefix; gateway }
-
-(* Construct a stack with the given static IPv4 config *)
 let stack =
-   if "xen" = Sys.getenv "MODE"
-    then generic_stackv4v6 ~ipv4_config net
-   else generic_stackv4v6 net
+  if "xen" = Sys.getenv "MODE" then
+    let ipv4_config : ipv4_config =
+      {
+        network = Ipaddr.V4.Prefix.of_string_exn "192.168.122.105/24";
+        gateway = Some (Ipaddr.V4.of_string_exn "192.168.122.1");
+      }
+    in
+    generic_stackv4v6 ~ipv4_config default_network
+  else generic_stackv4v6 default_network
+(* let http_server = cohttp_server @@ conduit_direct ~tls:false stack *)
 
-(* Register the unikernel *)
-let () = register "network" [ main $ stack ]
+let main =
+  let packages =
+    [
+      package
+        ~pin:
+          "git+file:///home/sidsabh/code/dc/MirageNet/ocaml-protoc-plugin#unix-free"
+        "ocaml-protoc-plugin";
+      package "mirage-crypto-rng";
+      package "h2-lwt";
+      package "h2-mirage";
+      package "grpc";
+      package "grpc-lwt";
+      (* package "tls-mirage"; *)
+    ]
+  in
+  main "Unikernel.RaftServer" ~packages
+    (random @-> time @-> pclock @-> stackv4v6 @-> job)
+
+let () =
+  register "raft"
+    [ main $ default_random $ default_time $ default_posix_clock $ stack ]

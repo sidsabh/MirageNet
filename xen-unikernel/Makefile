@@ -3,7 +3,7 @@
 -include Makefile.user
 BUILD_DIR = ./
 MIRAGE_DIR = ./mirage
-UNIKERNEL_NAME = raft-unix
+UNIKERNEL_NAME = raft-xen
 OPAM = opam
 
 all::

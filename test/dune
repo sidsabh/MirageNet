@@ -81,3 +81,15 @@
   raftkv
   h2
   h2-lwt-unix))
+
+(executable
+ (name test_server_getstate)
+ (libraries
+  grpc
+  grpc-lwt
+  ocaml-protoc-plugin
+  lwt
+  lwt.unix
+  raftkv
+  h2
+  h2-lwt-unix))

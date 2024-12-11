@@ -7,8 +7,9 @@ open Ocaml_protoc_plugin
 open Common
 
 (* Constants*)
-let timeout_duration = 0.3
+let timeout_duration = 1.0
 
+(* Signal handler *)
 (* Logging *)
 let setup_logs name =
   (* Create a custom reporter with timestamps including microseconds and additional formatting *)

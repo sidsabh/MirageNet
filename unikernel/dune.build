@@ -2,39 +2,22 @@
 
 (copy_files# ./mirage/main.ml)
 
-(copy_files ./mirage/manifest.json)
-
-(copy_files# ./mirage/manifest.ml)
-
-(copy_files ./mirage/network.xl)
-
-(copy_files ./mirage/network.xl.in)
-
-(copy_files ./mirage/network_libvirt.xml)
-
-(executable
- (enabled_if (= %{context_name} "solo5"))
- (name main)
- (modes (native exe))
- (libraries arp.mirage cmdliner-stdlib duration ethernet lwt mirage-bootvar
-   mirage-bootvar.xen mirage-clock-solo5 mirage-crypto-rng-mirage
-   mirage-logs mirage-net-xen mirage-runtime mirage-runtime.network
-   mirage-time mirage-xen tcpip.icmpv4 tcpip.ipv4 tcpip.ipv6
-   tcpip.stack-direct tcpip.tcp tcpip.udp)
- (link_flags :standard -w -70 -color always -cclib "-z solo5-abi=xen")
- (modules (:standard \ config manifest))
- (foreign_stubs (language c) (names manifest))
-)
-
 (rule
- (targets manifest.c)
- (deps manifest.json)
- (action
-  (run solo5-elftool gen-manifest manifest.json manifest.c)))
-
-(rule
- (target network.xen)
- (enabled_if (= %{context_name} "solo5"))
+ (target raft)
+ (enabled_if (= %{context_name} "default"))
  (deps main.exe)
  (action
   (copy main.exe %{target})))
+
+(executable
+ (name main)
+ (libraries cmdliner-stdlib duration grpc grpc-lwt h2-lwt h2-mirage lwt
+   mirage-bootvar mirage-bootvar.unix mirage-clock-unix mirage-crypto-rng
+   mirage-crypto-rng-mirage mirage-logs mirage-runtime
+   mirage-runtime.network mirage-time mirage-unix ocaml-protoc-plugin
+   tcpip.stack-socket tcpip.tcpv4v6-socket tcpip.udpv4v6-socket common raftkv)
+ (link_flags (-thread))
+ (modules (:standard \ config))
+ (flags :standard -w -70 -color always)
+ (enabled_if (= %{context_name} "default"))
+)
