@@ -2390,149 +2390,10 @@ let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
       H2.Headers.of_list
         [ "content-length", string_of_int (String.length response_body) ]
     in
-    let response_writer = start_response headers in
-    H2.Body.Writer.write_string response_writer response_body;
-    H2.Body.Writer.close response_writer
+    H2.Response.create ~headers `Internal_server_error
 
-  let start _random _time _clock _stack =
-    (* Retrieve the port from the runtime argument *)
-    let listening_port = port () in
-    Log.info (fun f -> f "Listening on port %d" listening_port);
 
-    (* Define the HTTP callback
-    let callback 
-    (_conn : Server.conn)
-    (req : Cohttp.Request.t)
-    (body : Cohttp_lwt.Body.t) =
-      let uri = Cohttp.Request.uri req in
-      let path = Uri.path uri in
-      match path with
-      | "/" -> 
-        let body  = Cohttp_lwt.Body.of_string "Hello, this is RaftServer!" in
-        (* send to grpc *)
-        Server.respond ~status:`OK ~body ()
-      | _ -> 
-        let body = Cohttp_lwt.Body.of_string "Not found" in
-        Server.respond ~status:`Not_found ~body () 
-
-    in
-
-    (* Define the HTTP server configuration *)
-    let conn_closed _conn_id = Log.info (fun f -> f "Connection closed") in
-
-    (* Explicitly pass the correct transport argument *)
-    http (`TCP listening_port) @@ Server.make ~conn_closed ~callback () *)
-
-  (* let start_server () =
-    let port = !id - 1 + Common.start_server_ports in
-    let listen_address = Unix.(ADDR_INET (get_vm_addr !id, port)) in
-    try
-      let server =
-        H2_lwt_unix.Server.create_connection_handler ?config:None
-          ~request_handler:(fun _ reqd ->
-            Grpc_lwt.Server.handle_request grpc_routes reqd)
-          ~error_handler:(fun _ ?request:_ _ _ ->
-            print_endline "an error occurred")
-      in
-      let+ server =
-        Lwt_io.establish_server_with_client_socket listen_address server
-      in
-      Logs.info (fun m -> m "Listening on port %i for grpc requests" port);
-      server
-    with
-    | Unix.Unix_error (err, func, arg) ->
-        (* Handle Unix system errors *)
-        failwith
-          (Printf.sprintf "Unix error: %s in function %s with argument %s"
-             (Unix.error_message err) func arg)
-    | exn ->
-        (* Other error cases *)
-        failwith (Printexc.to_string exn) *)
-
-  (* Function to create a connection to another server
-  let create_connection address port =
-    (* Retrieve the address information for the server *)
-    let* addresses =
-      Lwt_unix.getaddrinfo address (string_of_int port)
-        [ Unix.(AI_FAMILY PF_INET) ]
-    in
-    let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-
-    let src_port =
-      Common.start_bind_ports
-      + (!num_servers * (!id - 1))
-      + (port - Common.start_server_ports)
-    in
-    let bind_address = Unix.ADDR_INET (get_vm_addr !id, src_port) in
-    (* Setup socket*)
-
-    (* Show bind *)
-    Logs.info (fun m ->
-        m "Binding from %s:%d"
-          (Unix.string_of_inet_addr (get_vm_addr !id))
-          src_port);
-    Logs.info (fun m -> m "Connecting to %s:%d" address port);
-
-    Lwt_unix.bind socket bind_address >>= fun () ->
-    Lwt_unix.connect socket (List.hd addresses).Unix.ai_addr >>= fun () ->
-    let error_handler _ = print_endline "error" in
-
-    (* Launch *)
-    let* connection =
-      H2_lwt_unix.Client.create_connection ~error_handler socket
-    in
-    (* Store the connection in the global map *)
-    Hashtbl.add server_connections port connection;
-
-    Lwt.return () *)
-
-  (* Function to establish connections to all other servers *)
-  (* let establish_connections () =
-    (* Wait for a half a second for the other servers to spawn *)
-    let time = float_of_int !id *. 3. in
-    Lwt_unix.sleep time >>= fun () ->
-    let ports_to_connect =
-      List.init !num_servers (fun i -> Common.start_server_ports + i)
-      |> List.filter (fun p -> p <> !id - 1 + Common.start_server_ports)
-    in
-    Lwt_list.iter_s
-      (fun port ->
-        create_connection
-          (get_vm_string (port - Common.start_server_ports + 1))
-          port)
-      ports_to_connect *)
-
-  (* Main *)
-  (* let () =
-    (* Argv *)
-    id := int_of_string Sys.argv.(1);
-    num_servers := int_of_string Sys.argv.(2);
-
-    (* Setup *)
-    Random.self_init ();
-    Random.init ((Unix.time () |> int_of_float) + !id);
-    let module Log = (val setup_logs ("raftserver" ^ Sys.argv.(1))) in
-    (* Persistent storage loader, global side effect *)
-    ignore (initialize_server_state !id);
-
-    (* Launch three threads *)
-    let main =
-      let* server = start_server () in
-      (* server that responds to RPC (listens on 9xxx)*)
-      let* () = establish_connections () in
-      Lwt_unix.sleep 15. >>= fun () ->
-      setup_signal_handler
-        (fun () ->
-          let _ = Lwt_io.shutdown_server server in
-          Log.info (fun m ->
-              m "Received SIGTERM, shutting down, closing all sockets"))
-        server_connections;
-      follower_loop ()
-    in
-
-    Lwt_main.run main *)
-
-  let start _random _time _clock _stack =
+  let start _random _time _clock stack =
     (* Use the runtime argument for port *)
     let listening_port = port () in
     Logs.info (fun f -> f "Starting gRPC server on port %d" listening_port);
@@ -2546,62 +2407,10 @@ let server_connections : (int, H2_lwt_unix.Client.t) Hashtbl.t =
     let server =
       Http2.create_connection_handler ~request_handler ~error_handler
     in
-    
-    http2 (`TCP listening_port) @@ server
 
-    (* http (`TCP listening_port) server *)
-      
+    (* Listen on the specified port with the H2 connection handler *)
+    (* Stack.listen stack; *)
+    let tcp = TCP.create_connection (Stack.tcp stack) in
+    Stack.listen stack;
 
-
-  
-  (* let start time clock http =
-    let listening_port = port () in
-    Log.info (fun f -> f "Starting gRPC server on port %d" listening_port);
-  
-    let request_handler reqd =
-      (* Dispatch to our gRPC routes *)
-      Grpc_lwt.Server.handle_request grpc_routes reqd
-    in
-  
-    let error_handler ?request:_ error start_response =
-      (* Handle errors gracefully *)
-      let response_body = start_response H2.Headers.empty in
-      H2.Body.Writer.write_string response_body "Error handled";
-      H2.Body.Writer.flush response_body (fun () ->
-          H2.Body.Writer.close response_body)
-    in
-  
-    let server =
-      Server.create_connection_handler
-        ~request_handler
-        ~error_handler
-    in
-  
-    (* Start listening on the specified port using the `http` impl, which is MirageOS provided *)
-    http (`TCP listening_port) server *)
-
-    
-  (* let _start _time clock http =
-    (* Retrieve the port from the runtime argument *)
-    let listening_port = port () in
-    Log.info (fun f -> f "Listening on port %d" listening_port);
-
-    (* Define the HTTP callback *)
-    let callback (_conn : Server.conn) (req : Cohttp.Request.t)
-        (_body : Cohttp_lwt.Body.t) =
-      let time = Clock.now_d_ps clock |> Ptime.v in
-      Log.info (fun f ->
-          f "Received request: %s" (Uri.to_string (Cohttp.Request.uri req)));
-      Log.info (fun f -> f "Time: %a" Ptime.pp time);
-
-      let headers = Cohttp.Header.init_with "content-type" "application/json" in
-      let body = Format.asprintf "{ \"time\": \"%a\" }" Ptime.pp time in
-      Server.respond_string ~status:`OK ~headers ~body ()
-    in
-
-    (* Define the HTTP server configuration *)
-    let conn_closed _conn_id = Log.info (fun f -> f "Connection closed") in
-
-    (* Explicitly pass the correct transport argument *)
-    http (`TCP listening_port) @@ Server.make ~conn_closed ~callback () *)
 end
