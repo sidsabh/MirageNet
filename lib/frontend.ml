@@ -7,7 +7,7 @@ open Ocaml_protoc_plugin
 open Common
 
 (* Constants*)
-let timeout_duration = 1.0
+let timeout_duration = 0.3
 
 (* Signal handler *)
 (* Logging *)
