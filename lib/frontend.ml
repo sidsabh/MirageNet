@@ -106,13 +106,18 @@ let send_request_to_leader ~(rpc_name : string) ~service ~request
         let* result = Lwt.pick [ timeout; rpc_call ] in
         match result with
         | Ok response, _ ->
-            let wrong_leader, leader_hint = extract_leader_info response in
-            if wrong_leader then (
-              leader_id := int_of_string leader_hint;
-              Log.debug (fun m ->
-                  m "%s: Leader is wrong, trying raftserver%d" rpc_name
-                    !leader_id);
-              loop ())
+              let wrong_leader, leader_hint = extract_leader_info response in
+              if wrong_leader then (
+                let potential_leader_id = int_of_string leader_hint in
+                if potential_leader_id = !leader_id then (
+                  leader_id := if !leader_id = !num_servers then 1 else !leader_id + 1;
+                ) else
+                  leader_id := potential_leader_id;
+                Log.debug (fun m ->
+                    m "%s: Leader is wrong, trying raftserver%d" rpc_name
+                      !leader_id);
+                loop ()
+              )
             else (
               Log.debug (fun m ->
                   m "%s RPC to server %d successful" rpc_name !leader_id);
@@ -122,7 +127,7 @@ let send_request_to_leader ~(rpc_name : string) ~service ~request
                 m "%s RPC to server %d failed, trying next server" rpc_name
                   !leader_id);
             (* Move to the next server *)
-            leader_id := (!leader_id mod !num_servers) + 1;
+            leader_id := if !leader_id = !num_servers then 1 else !leader_id + 1;
             loop ())
       (fun ex ->
         (* Handle timeouts and exceptions *)
