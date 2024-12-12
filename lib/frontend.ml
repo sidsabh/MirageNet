@@ -106,16 +106,9 @@ let send_request_to_leader ~(rpc_name : string) ~service ~request
         let* result = Lwt.pick [ timeout; rpc_call ] in
         match result with
         | Ok response, _ ->
-              let wrong_leader, leader_hint = extract_leader_info response in
+              let wrong_leader, _leader_hint = extract_leader_info response in
               if wrong_leader then (
-                let potential_leader_id = int_of_string leader_hint in
-                if potential_leader_id = !leader_id then (
-                  leader_id := if !leader_id = !num_servers then 1 else !leader_id + 1;
-                ) else
-                  leader_id := potential_leader_id;
-                Log.debug (fun m ->
-                    m "%s: Leader is wrong, trying raftserver%d" rpc_name
-                      !leader_id);
+                leader_id := if !leader_id = !num_servers then 1 else !leader_id + 1;
                 loop ()
               )
             else (
@@ -135,7 +128,7 @@ let send_request_to_leader ~(rpc_name : string) ~service ~request
             m "%s RPC to server %d failed with: %s. Trying next server."
               rpc_name !leader_id (Printexc.to_string ex));
         (* Move to the next server *)
-        leader_id := (!leader_id mod !num_servers) + 1;
+        leader_id := if !leader_id = !num_servers then 1 else !leader_id + 1;
         loop ())
   in
   loop ()
@@ -239,6 +232,24 @@ let read_request buffer decode name =
         (Printf.sprintf "Error decoding %s request: %s" name
            (Result.show_error e))
 
+(* Handle New Leader *)
+let handle_new_leader_request buffer =
+  let open Ocaml_protoc_plugin in
+  let open Raftkv in
+  let decode, encode = Service.make_service_functions FrontEnd.newLeader in
+  let request = 
+    Reader.create buffer |> decode |> function
+    | Ok v ->
+      Printf.printf "Received NewLeader request with arg: %d\n" v;
+      flush stdout;
+      v
+    | Error e -> failwith (Printf.sprintf "Error decoding NewLeader request: %s" (Result.show_error e))
+  in
+  leader_id := request;
+
+  let reply = FrontEnd.NewLeader.Response.make () in
+  Lwt.return (Grpc.Status.(v OK), Some (encode reply |> Writer.contents))
+
 (* Handle StartRaft *)
 let handle_start_raft_request buffer =
   let decode, encode =
@@ -268,6 +279,7 @@ let frontend_service =
     |> add_rpc ~name:"Put" ~rpc:(Unary handle_put_request)
     |> add_rpc ~name:"Replace" ~rpc:(Unary handle_replace_request)
     |> add_rpc ~name:"StartRaft" ~rpc:(Unary handle_start_raft_request)
+    |> add_rpc ~name:"NewLeader" ~rpc:(Unary handle_new_leader_request)
     |> handle_request)
 
 let grpc_routes =
