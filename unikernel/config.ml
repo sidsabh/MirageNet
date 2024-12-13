@@ -17,7 +17,7 @@ let main =
     [
       package
         ~pin:
-          "git+file:///home/sidsabh/code/dc/MirageNet/ocaml-protoc-plugin#unix-free"
+          "git+https://github.com/sidsabh/ocaml-protoc-plugin.git#unix-free"
         "ocaml-protoc-plugin";
       package "mirage-crypto-rng";
       package "h2-lwt";
