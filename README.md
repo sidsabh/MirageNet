@@ -1,18 +1,20 @@
 ### Core Raft Implementation
 #### Build Instructions (Docker)
-1. Get the code
-  ```
-  git clone https://github.com/sidsabh/MirageRaft.git && cd MirageRaft
-  ```
-2. Build the container (~5-10 minutes)
+1. Get the code, build the container (~5 minutes)
 ```
+git clone https://github.com/sidsabh/MirageRaft.git && cd MirageRaft
 sudo docker build -t mirage-raft .
 ```
-3. Launch the frontend on the host network (blocking ports, spawning Raft Servers will all work per usual on localhost)
+OR 
+1. Pull the Docker image
 ```
-sudo docker run -it --network=host  mirage-raft
+docker pull sidsabh/mirage-raft:mirage-raft
 ```
-4. Cleanup if a run is still holding a port
+2. Launch the frontend on the host network (blocking ports, spawning Raft Servers will all work per usual on localhost)
+```
+sudo docker run -it --network=host  mirage-raft #  sidsabh/mirage-raft:mirage-raft if you pulled from Docker Hub
+```
+3. Cleanup if a run is still holding a port
 ```
 sudo docker rm -f $(sudo docker ps -aq)
 ```
