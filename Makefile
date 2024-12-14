@@ -26,7 +26,7 @@ $(DATA_DIR):
 	mkdir -p $(DATA_DIR)
 
 # Copy executable to bin for server
-$(BIN_DIR)/server: $(SERVER_EXEC) | $(BIN_DIR)
+$(BIN_DIR)/server: $(SERVER_EXEC) | $(BIN_DIR) $(DATA_DIR)
 	cp $(SERVER_EXEC) $(BIN_DIR)/server
 
 # Copy executable to bin for frontend
@@ -47,6 +47,6 @@ down:
 
 # Clean build artifacts and bin directory
 clean: down
-	rm -rf $(BIN_DIR)/*
+	rm -rf $(BIN_DIR)
 	rm -rf $(DATA_DIR)
 	dune clean

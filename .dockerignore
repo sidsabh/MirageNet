@@ -1,0 +1,29 @@
+# Ignore build artifacts
+_build/
+bin/
+_opam/
+duniverse/
+data/
+raft.log
+strace_*
+*.qcow2
+*xen
+
+# Ignore hidden files (except .dockerignore)
+.*
+!.dockerignore
+
+# Ignore temporary and log files
+*.log
+*.tmp
+
+# Ignore mirage directories
+**/mirage/
+**/dist/
+
+# Other
+ocaml-protoc-plugin/
+test/
+unikernel/
+xen-unikernel/
+vm/
