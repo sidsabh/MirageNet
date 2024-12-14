@@ -8,7 +8,7 @@
 ```
 sudo docker build -t mirage-raft .
 ```
-3. Launch the frontend on the host network (blocking ports, spawning Raft Servers will all work per usual om localhost)
+3. Launch the frontend on the host network (blocking ports, spawning Raft Servers will all work per usual on localhost)
 ```
 sudo docker run -it --network=host  mirage-raft
 ```
