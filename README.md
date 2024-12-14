@@ -1,16 +1,39 @@
 ### Core Raft Implementation
 #### Build Instructions (Docker)
-1. git clone https://github.com/sidsabh/MirageRaft.git && cd MirageRaft
-2. (~2 MINUTES) sudo docker build -t mirage-raft . 
-3. sudo docker run -it --network=host  mirage-raft
-4. (POST-RUN) sudo docker rm -f $(sudo docker ps -aq)
+1. Get the code
+  ```
+  git clone https://github.com/sidsabh/MirageRaft.git && cd MirageRaft
+  ```
+2. Build the container (~2 minutes)
+```
+sudo docker build -t mirage-raft .
+```
+3. Launch the frontend on the host network (blocking ports, spawning Raft Servers will all work per usual om localhost)
+```
+sudo docker run -it --network=host  mirage-raft
+```
+4. Cleanup if a run is still holding a port
+```
+sudo docker rm -f $(sudo docker ps -aq)
+```
 
 #### Build Instructions (manual)
-1. apt install opam (will also install ocaml) using [guide](https://ocaml.org/install#linux_mac_bsd). make sure ocamlc version >=4.14.0 (e.g., opam switch create 4.14.0 --yes)
-2. opam install dune
-3. opam install . --deps-only
-4. make up (launches frontend)
-5. run tests (demo [here](https://www.youtube.com/watch?v=o2JRtMvaK9s))
+1. Install opam (includes OCaml compiler) via [guide](https://ocaml.org/install#linux_mac_bsd).  Make sure ocamlc version >=4.14 (e.g., opam switch create 4.14.0 --yes)
+2. Install stuff from apt and opam:
+```
+sudo apt-get update && sudo apt-get install -y \
+    curl \
+    protobuf-compiler \
+    pkg-config
+opam install dune
+opam install . --deps-only
+opam install fmt --yes
+```
+3. Launch via
+```
+make up
+```
+4. run tests (demo [here](https://www.youtube.com/watch?v=o2JRtMvaK9s))
 
 
 
