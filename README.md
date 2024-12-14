@@ -1,10 +1,18 @@
 ### Core Raft Implementation
-#### Build Instructions
+#### Build Instructions (Docker)
+1. git clone https://github.com/sidsabh/MirageRaft.git && cd MirageRaft
+2. (~2 MINUTES) sudo docker build -t mirage-raft . 
+3. sudo docker run -it --network=host  mirage-raft
+4. (POST-RUN) sudo docker rm -f $(sudo docker ps -aq)
+
+#### Build Instructions (manual)
 1. apt install opam (will also install ocaml) using [guide](https://ocaml.org/install#linux_mac_bsd). make sure ocamlc version >=4.14.0 (e.g., opam switch create 4.14.0 --yes)
-3. opam install dune
-2. opam install . --deps-only
-3. make up (launches frontend)
-4. run tests (demo [here](https://www.youtube.com/watch?v=o2JRtMvaK9s))
+2. opam install dune
+3. opam install . --deps-only
+4. make up (launches frontend)
+5. run tests (demo [here](https://www.youtube.com/watch?v=o2JRtMvaK9s))
+
+
 
 ### Distributed Unikernels
 #### Demos
