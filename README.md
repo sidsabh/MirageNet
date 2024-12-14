@@ -4,7 +4,7 @@
   ```
   git clone https://github.com/sidsabh/MirageRaft.git && cd MirageRaft
   ```
-2. Build the container (~2 minutes)
+2. Build the container (~5-10 minutes)
 ```
 sudo docker build -t mirage-raft .
 ```
